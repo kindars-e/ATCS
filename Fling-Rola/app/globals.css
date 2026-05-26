@@ -1,0 +1,314 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ════════════════════════════════════════════════════════════════════════
+   ATCS — Alternative Text-based Communication System
+   CENTRALIZED THEME (dark brick-red identity)
+
+   All brand colors live HERE as CSS variables so there is a single source of
+   truth. Components reference these via:
+     • shadcn tokens (--primary, --card, …) used by ui/* components, and
+     • the --brick-* / --atcs-* scale below, mapped onto Tailwind's blue-*
+       utilities at the bottom of this file so existing `bg-blue-600` etc.
+       become brick-red WITHOUT editing every component by hand.
+
+   Palette direction: deep brick red + dark maroon + muted crimson over a
+   charcoal foundation, with soft warm accents. Tuned for low-light readability
+   and an emergency/rugged feel (no neon, no oversaturation).
+   ════════════════════════════════════════════════════════════════════════ */
+:root {
+  /* Brick-red brand scale (light → dark). OKLCH keeps the steps perceptually
+     even. These intentionally mirror Tailwind's 100…900 ramp so they can slot
+     in as replacements for the old blue ramp. */
+  --brick-100: oklch(0.90 0.045 27);   /* palest tint  */
+  --brick-300: oklch(0.74 0.10 27);    /* light accent */
+  --brick-400: oklch(0.64 0.14 27);    /* muted crimson */
+  --brick-500: oklch(0.55 0.16 27);    /* primary brick red */
+  --brick-600: oklch(0.47 0.155 28);   /* deep brick red (main action) */
+  --brick-700: oklch(0.39 0.13 28);    /* dark brick */
+  --brick-800: oklch(0.31 0.10 28);    /* dark maroon */
+  --brick-900: oklch(0.23 0.075 28);   /* deepest maroon */
+
+  /* Charcoal foundation (kept dark + slightly warm to sit under brick red). */
+  --atcs-bg:       oklch(0.17 0.01 30); /* app background */
+  --atcs-surface:  oklch(0.22 0.012 30);/* cards / panels */
+  --atcs-surface2: oklch(0.27 0.014 30);/* raised / inputs */
+  --atcs-border:   oklch(0.32 0.02 30); /* subtle warm borders */
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+:root {
+  --radius: 0.625rem;
+  /* shadcn tokens retuned to the ATCS brick-red identity (light fallback;
+     the app runs in dark mode, themed just below). */
+  --background: oklch(0.17 0.01 30);
+  --foreground: oklch(0.97 0.01 60);
+  --card: oklch(0.22 0.012 30);
+  --card-foreground: oklch(0.97 0.01 60);
+  --popover: oklch(0.22 0.012 30);
+  --popover-foreground: oklch(0.97 0.01 60);
+  --primary: var(--brick-600);
+  --primary-foreground: oklch(0.98 0.01 60);
+  --secondary: oklch(0.27 0.014 30);
+  --secondary-foreground: oklch(0.97 0.01 60);
+  --muted: oklch(0.27 0.014 30);
+  --muted-foreground: oklch(0.72 0.02 40);
+  --accent: var(--brick-700);
+  --accent-foreground: oklch(0.98 0.01 60);
+  --destructive: oklch(0.55 0.20 25);
+  --border: var(--atcs-border);
+  --input: oklch(0.27 0.014 30);
+  --ring: var(--brick-500);
+  --chart-1: var(--brick-500);
+  --chart-2: var(--brick-400);
+  --chart-3: var(--brick-700);
+  --chart-4: oklch(0.70 0.13 50);
+  --chart-5: oklch(0.62 0.15 35);
+  --sidebar: oklch(0.20 0.012 30);
+  --sidebar-foreground: oklch(0.97 0.01 60);
+  --sidebar-primary: var(--brick-600);
+  --sidebar-primary-foreground: oklch(0.98 0.01 60);
+  --sidebar-accent: oklch(0.27 0.014 30);
+  --sidebar-accent-foreground: oklch(0.97 0.01 60);
+  --sidebar-border: var(--atcs-border);
+  --sidebar-ring: var(--brick-500);
+}
+
+.dark {
+  --background: oklch(0.17 0.01 30);
+  --foreground: oklch(0.97 0.01 60);
+  --card: oklch(0.22 0.012 30);
+  --card-foreground: oklch(0.97 0.01 60);
+  --popover: oklch(0.22 0.012 30);
+  --popover-foreground: oklch(0.97 0.01 60);
+  --primary: var(--brick-600);
+  --primary-foreground: oklch(0.98 0.01 60);
+  --secondary: oklch(0.27 0.014 30);
+  --secondary-foreground: oklch(0.97 0.01 60);
+  --muted: oklch(0.27 0.014 30);
+  --muted-foreground: oklch(0.72 0.02 40);
+  --accent: var(--brick-700);
+  --accent-foreground: oklch(0.98 0.01 60);
+  --destructive: oklch(0.62 0.21 25);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: var(--brick-500);
+  --chart-1: var(--brick-500);
+  --chart-2: var(--brick-400);
+  --chart-3: var(--brick-700);
+  --chart-4: oklch(0.70 0.13 50);
+  --chart-5: oklch(0.62 0.15 35);
+  --sidebar: oklch(0.20 0.012 30);
+  --sidebar-foreground: oklch(0.97 0.01 60);
+  --sidebar-primary: var(--brick-600);
+  --sidebar-primary-foreground: oklch(0.98 0.01 60);
+  --sidebar-accent: oklch(0.27 0.014 30);
+  --sidebar-accent-foreground: oklch(0.97 0.01 60);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: var(--brick-500);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+/* ATCS dark base - prevent white flash and smooth transitions */
+html, body, #__next {
+  background-color: oklch(0.17 0.01 30) !important; /* warm charcoal (was #111827) */
+  min-height: 100vh;
+  margin: 0;
+  padding: 0;
+}
+
+/* Smooth fade-in animation */
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Scale in animation */
+@keyframes scale-in {
+  from {
+    transform: scale(0.8);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+/* Float animation for particles */
+@keyframes float {
+  0%, 100% { 
+    transform: translateY(0px) translateX(0px); 
+  }
+  33% { 
+    transform: translateY(-30px) translateX(10px); 
+  }
+  66% { 
+    transform: translateY(30px) translateX(-10px); 
+  }
+}
+
+/* Twinkle animation for stars */
+@keyframes twinkle {
+  0%, 100% { 
+    opacity: 0.2; 
+  }
+  50% { 
+    opacity: 0.8; 
+  }
+}
+
+/* Hide scrollbars during splash */
+body.splash-active {
+  overflow: hidden;
+}
+
+/* Animation utilities */
+.animate-fade-in {
+  animation: fade-in 0.8s ease-out both;
+}
+
+.animate-scale-in {
+  animation: scale-in 0.6s ease-out both;
+}
+
+/* Ensure smooth text rendering */
+* {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Remove any default margins/paddings that might cause white edges */
+html {
+  overflow-x: hidden;
+}
+
+.app-container {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   ATCS BRAND COLOR MAPPING (centralized — no per-component edits needed)
+
+   The app was built with hardcoded Tailwind `blue-*` utilities for its accent
+   color. Rather than edit dozens of files, we REMAP those exact utility class
+   names to the brick-red scale here. Every `bg-blue-600`, `text-blue-400`,
+   `border-blue-500`, hover/ring variants, etc. now render brick-red.
+
+   This keeps a single source of truth and means future tweaks happen in ONE
+   place. Tailwind v4 utilities resolve to `--tw-*`-style declarations, so we
+   override the resulting `background-color` / `color` / `border-color` for the
+   blue utility classes directly.
+   ════════════════════════════════════════════════════════════════════════ */
+
+/* Backgrounds */
+.bg-blue-100 { background-color: var(--brick-100) !important; }
+.bg-blue-300 { background-color: var(--brick-300) !important; }
+.bg-blue-400 { background-color: var(--brick-400) !important; }
+.bg-blue-500 { background-color: var(--brick-500) !important; }
+.bg-blue-600 { background-color: var(--brick-600) !important; }
+.bg-blue-700 { background-color: var(--brick-700) !important; }
+.bg-blue-900 { background-color: var(--brick-900) !important; }
+
+/* Hover backgrounds */
+.hover\:bg-blue-600:hover { background-color: var(--brick-600) !important; }
+.hover\:bg-blue-700:hover { background-color: var(--brick-700) !important; }
+.hover\:bg-blue-500:hover { background-color: var(--brick-500) !important; }
+
+/* Text */
+.text-blue-100 { color: var(--brick-100) !important; }
+.text-blue-300 { color: var(--brick-300) !important; }
+.text-blue-400 { color: var(--brick-400) !important; }
+.text-blue-500 { color: var(--brick-500) !important; }
+.text-blue-600 { color: var(--brick-600) !important; }
+
+/* Borders */
+.border-blue-400 { border-color: var(--brick-400) !important; }
+.border-blue-500 { border-color: var(--brick-500) !important; }
+.border-blue-600 { border-color: var(--brick-600) !important; }
+.border-blue-700 { border-color: var(--brick-700) !important; }
+
+/* Rings / focus states */
+.ring-blue-400 { --tw-ring-color: var(--brick-400) !important; }
+.ring-blue-500 { --tw-ring-color: var(--brick-500) !important; }
+.focus\:ring-blue-500:focus { --tw-ring-color: var(--brick-500) !important; }
+
+/* Gradient stops (used on some buttons/accents) */
+.from-blue-500 { --tw-gradient-from: var(--brick-500) !important; }
+.from-blue-600 { --tw-gradient-from: var(--brick-600) !important; }
+.to-blue-600   { --tw-gradient-to:   var(--brick-600) !important; }
+.to-blue-700   { --tw-gradient-to:   var(--brick-700) !important; }
+
+/* Shadows that referenced blue glow → warm brick glow */
+.shadow-blue-500\/25 { --tw-shadow-color: oklch(0.55 0.16 27 / 0.25) !important; }
+.shadow-blue-500\/30 { --tw-shadow-color: oklch(0.55 0.16 27 / 0.30) !important; }
+
+/* ── Warm the charcoal foundation ───────────────────────────────────────────
+   The app uses gray-900/800/700 heavily for backgrounds, cards and inputs.
+   Nudging these toward a warm charcoal makes the brick-red read as intentional
+   rather than clashing with a cold neutral gray. Subtle on purpose. */
+.bg-gray-900 { background-color: oklch(0.17 0.01 30) !important; }
+.bg-gray-800 { background-color: oklch(0.22 0.012 30) !important; }
+.bg-gray-700 { background-color: oklch(0.27 0.014 30) !important; }
