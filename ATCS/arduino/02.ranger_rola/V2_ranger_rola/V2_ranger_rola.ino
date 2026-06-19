@@ -1,86 +1,115 @@
 /*
  * ╔══════════════════════════════════════════════════════════════════════
- * ║  Ranger Rola Firmware — v7 (LED system + multifunction button)      ║
+ * ║  Ranger Mesh Firmware — v8 (full mesh networking)                    ║
  * ╠══════════════════════════════════════════════════════════════════════╣
- * ║  Works with the Fling app (Wi-Fi + WebSocket, port 8765).           ║
- * ║  Uses the Rola hardware pin layout and SPI LoRa library.            ║
+ * ║  Works with the Fling app (Wi-Fi + WebSocket, port 8765).            ║
+ * ║  Uses the Rola hardware pin layout and SPI LoRa library.             ║
  * ║                                                                      ║
- * ║  HOW TO CONFIGURE:                                                   ║
+ * ║  HOW TO CONFIGURE EACH NODE:                                         ║
  * ║    1. Find the "DEVICE IDENTITY" section below.                      ║
- * ║    2. Change THIS_DEVICE_ID to a unique name (no spaces/colons).    ║
- * ║    3. Change WIFI_SSID to match — e.g. "Fling_Node2"                ║
- * ║    4. Flash to the ESP32.  Repeat for each node with a new ID.      ║
+ * ║    2. Change THIS_DEVICE_ID to a unique name (no spaces/colons).     ║
+ * ║       This name IS the node's mesh address — every node on the       ║
+ * ║       network must have a different one (e.g. "Node1".."Node4").    ║
+ * ║    3. Change WIFI_SSID to match — e.g. "Fling_Node2"                 ║
+ * ║    4. Flash to the ESP32.  Repeat for each node with a new ID.       ║
  * ║                                                                      ║
  * ║  The app connects to:  ws://192.168.4.1:8765                        ║
  * ║  WiFi password is always:  fling1234                                 ║
  * ╚══════════════════════════════════════════════════════════════════════╝
  *
- * ── PACKET FORMAT ON LoRa AIR ────────────────────────────────────────
+ * ══════════════════════════════════════════════════════════════════════
+ *  WHAT CHANGED IN v8 — PEER-TO-PEER  →  FULL MESH
+ * ══════════════════════════════════════════════════════════════════════
  *
- *   Regular message :  "Node1:Node2:Hello there"
- *   Broadcast       :  "Node1:*:SOS help!"           ← goes to ALL nodes
- *   ACK reply       :  "ACK:Node1"
- *   Discovery ping  :  "Node1:*:##DISCOVERY_PING##"
- *   Discovery pong  :  "Node2:Node1:##DISCOVERY_PONG##"
- *   Location data   :  "Node1:Node2:##LOCATION_RESPONSE##13.12,32.56,5.0"
- *   Pair request    :  "Node1:Node2:##PAIR_REQ##Fling_Node1"
- *   Pair accept     :  "Node2:Node1:##PAIR_ACK##Fling_Node2"
+ *  BEFORE (v7 and earlier): every LoRa packet was a flat string
+ *  "SENDER:RECIPIENT:CONTENT" and was assumed to travel in exactly ONE
+ *  radio hop. Two nodes that couldn't hear each other directly could
+ *  never talk. Reliability was a bare unicast "ACK:<sender>" string with
+ *  no message ID, no de-duplication, and no idea what to do if a packet
+ *  needed to travel through another node to reach its destination.
  *
- * ── CHANGES IN v7 (LED system + multifunction button overhaul) ───────
+ *  NOW (v8): every node runs identical mesh-networking firmware and can
+ *  act as a SENDER, RECEIVER, and RELAY at the same time. Packets carry
+ *  a structured binary header (see "MESH PACKET FORMAT" below) with a
+ *  message ID, hop count, TTL, priority, and routing fields. Nodes:
+ *    • discover their direct radio neighbours (HELLO beacons),
+ *    • discover multi-hop routes on demand (RREQ / RREP, like the
+ *      classic AODV mesh routing algorithm),
+ *    • flood broadcast/SOS traffic outward hop-by-hop with loop and
+ *      duplicate protection,
+ *    • retry lost unicast deliveries end-to-end, and
+ *    • recover automatically when a relay node disappears.
  *
- *  ROOT CAUSE ANALYSIS — what existed before v7:
- *   • A Blue LED (pin 14) was used as a raw "radio activity" blinker. It
- *     blinked on every TX/RX event. This gave no actionable information:
- *     it looked identical whether the system was healthy, searching, or
- *     failing.
- *   • The USER/BTN_USER button (pin 0) sent a broadcast PING on every
- *     single press — no other actions, no double-press, no long-press.
- *   • There was no centralized LED state-management. LEDs were driven by
- *     ad-hoc function calls scattered across the code.
+ *  IMPORTANT: the WebSocket JSON contract with the phone app (the
+ *  "type": "send" / "message" / "discovery" / "delivery" / ... frames
+ *  defined in lib/protocol.ts) is UNCHANGED. The phone app does not know
+ *  or care that messages might now travel through 1, 2, or 3 other
+ *  nodes to reach their destination — that complexity is fully
+ *  contained inside this firmware.
  *
- *  WHAT v7 DOES:
- *   • Replaces the Blue LED completely with the Yellow LED (pin 14, same
- *     physical pin — just rename in hardware and here). Yellow = searching
- *     / warning, which is far more meaningful than a blue "blink".
- *   • Adds a centralized LED state machine with a priority system:
- *       EMERGENCY (red) > WARNING/SEARCH (yellow) > NORMAL (green)
- *   • Adds a proper multifunction button with debounce, single-press,
- *     double-press, and long-press detection — all non-blocking.
- *   • SOS button logic is UNTOUCHED. Only LED reflection was added.
+ * ── MESH PACKET FORMAT ON LoRa AIR ───────────────────────────────────
  *
- *  MULTIFUNCTION BUTTON ACTIONS (BTN_USER / pin 0):
- *   • Single press  → start/stop discovery scan
- *       Reason: the most common field action is "find nearby nodes". One
- *       press fires a scan; pressing again while scanning cancels it.
- *   • Double press  → reconnect (reset communication layer)
- *       Reason: when comms feel stale or the app dropped, a double-press
- *       is fast and memorable. It kicks a fresh scan and resets state.
- *   • Long press (≥2 s) → safe restart of the node
- *       Reason: a deliberate, hard-to-trigger action for when you need a
- *       clean reboot. Long press is hard to do accidentally.
+ *  Every packet is a small binary header followed by a payload of raw
+ *  text bytes (the same chat text / sentinel strings the app already
+ *  uses, e.g. "##PAIR_REQ##Fling_Node1"). We use raw bytes (not a colon
+ *  delimited string like before) because we now need to pack several
+ *  small numeric fields (message ID, TTL, hop count, priority) that a
+ *  text format can't represent compactly or unambiguously.
  *
- *  LED SYSTEM (simplified):
- *   GREEN (pin 2):
- *     solid ON        = connected and ready (Wi-Fi AP up, LoRa ready)
- *     slow blink 3×   = message TX/RX confirmed (ACK received)
- *   YELLOW (pin 14, replaces Blue):
- *     slow blink      = scanning / searching for nodes
- *     fast blink      = reconnecting / no app client connected
- *   RED (pin 12):
- *     fast blink 5×   = emergency / SOS activity
- *     solid ON        = critical failure (LoRa init failed)
+ *  Header layout (31 bytes, all fixed-position):
+ *    byte  0      : packet type        (DATA / ACK / HELLO / RREQ / ...)
+ *    bytes 1-2    : message ID         (16-bit, set by the ORIGINATOR)
+ *    bytes 3-10   : source NodeID      (8 bytes, e.g. "Node1\0\0\0")
+ *    bytes 11-18  : destination NodeID (8 bytes, or "*\0\0\0\0\0\0\0" = broadcast)
+ *    bytes 19-26  : previous-hop NodeID (who physically sent us this copy)
+ *    byte  27     : TTL                (Time To Live — hop budget left)
+ *    byte  28     : hop count          (hops travelled so far, for diagnostics)
+ *    byte  29     : priority           (0 normal, 1 control, 2 = SOS/emergency)
+ *    byte  30     : payload length     (0-180 bytes follow the header)
  *
- *  All prior fixes from v2–v6 are fully preserved (SF9, sync word,
- *  CRC, SOS repeats, heartbeat, SNR diagnostics, edge detection).
+ *  A node never sends the raw C struct over the air — it manually packs
+ *  each field byte-by-byte (see encodeHeader/decodeHeader) so the format
+ *  is exact and portable, with no compiler padding surprises.
  *
- * ── ALL PRIOR CHANGE NOTES (preserved for history) ───────────────────
+ *  Packet types:
+ *    DATA            – a real message for the app (chat text, sentinel
+ *                       strings, BEEP, etc.) — unicast or broadcast.
+ *    ACK              – "I (dst) received your message (msgId)."
+ *    HELLO            – 1-hop-only beacon: "I'm <id>, here's my battery."
+ *    RREQ             – "Does anyone know how to reach <dst>?" (floods)
+ *    RREP             – "I'm <dst> (or know a route) — here's the way back."
+ *    DISCOVER         – app-triggered "who else is out there?" (floods,
+ *                       can find nodes multiple hops away — an upgrade
+ *                       over the old single-hop discovery ping).
+ *    DISCOVER_REPLY   – a node's answer to a DISCOVER, routed back.
  *
- *  v2: All delay() replaced with non-blocking millis() timers.
- *  v3: Broadcast routing fix. ACK storm fix. ##PAIR_REQ/ACK## forwarding.
- *  v4: Button edge detection — SOS and USER buttons fire once per press.
- *  v5: SF12→7, WebSocket heartbeat, SOS repeat reliability.
- *  v6: SF7→9 for range, PA_BOOST explicit, sync word 0xF3, CRC enabled,
- *      SNR diagnostics added alongside RSSI.
+ * ── HOW EACH MESH CHALLENGE IS SOLVED (see full write-up given to the
+ *    project owner for details) ─────────────────────────────────────
+ *    • Multi-hop            → TTL-bounded relay + AODV-style routing
+ *    • Reliable delivery     → end-to-end ACK + retry with backoff
+ *    • Duplicate detection   → per-(source,msgId) "seen" cache
+ *    • Routing loops         → TTL decrement + seen cache catches loops
+ *    • TTL management        → MESH_TTL_MAX, decremented every hop
+ *    • Neighbor discovery    → periodic HELLO beacons (1 hop only)
+ *    • Route discovery       → reactive RREQ / RREP flood + reverse path
+ *    • Route maintenance     → routes expire; broken routes invalidated
+ *                              on repeated ACK failure
+ *    • Node failure recovery → broken-route detection triggers fresh
+ *                              route discovery automatically
+ *    • Collision mitigation  → randomized jitter before every
+ *                              broadcast/flood-style transmission
+ *    • Congestion management → priority send queue + bounded table sizes
+ *    • Priority handling     → SOS > control traffic > normal chat
+ *    • Scalability            → reactive routing + bounded tables/TTL
+ *                              keep cost flat regardless of mesh size
+ *    • Payload protection    → LoRa hardware CRC + payload length checks
+ *    • Efficient forwarding  → seen-cache avoids re-flooding known packets
+ *    • Battery-awareness     → low-battery nodes stop relaying others'
+ *                              traffic (still send/receive their own)
+ *
+ *  All v7 LED states, the multifunction button, and the dedicated SOS
+ *  button are preserved with the same field-tested behaviour — they now
+ *  just trigger mesh sends instead of single-hop string sends.
  */
 
 // ── LIBRARIES ─────────────────────────────────────────────────────────
@@ -104,13 +133,18 @@
 #define BTN_USER     0   // Multifunction button (single / double / long press)
 
 #define LED_GREEN    2   // Normal operation / connected
-#define LED_YELLOW  14   // Searching / warning  ← was LED_BLUE, same pin
+#define LED_YELLOW  14   // Searching / warning
 #define LED_RED     12   // Emergency / critical failure
 
 // ════════════════════════════════════════════════════════════════════════
 // DEVICE IDENTITY  ← EDIT THIS SECTION FOR EACH NODE
+//
+// THIS_DEVICE_ID is both the friendly name shown in the app AND the
+// node's unique mesh address used inside every packet header. It MUST
+// be different on every physical node and MUST be 8 characters or
+// fewer (NODE_ID_LEN below) so it fits the fixed-size header field.
 // ════════════════════════════════════════════════════════════════════════
-#define THIS_DEVICE_ID  "Node1"          // ← Change per node
+#define THIS_DEVICE_ID  "Node1"          // ← Change per node (max 8 chars)
 #define WIFI_SSID       "Fling_Node1"    // ← Must match THIS_DEVICE_ID suffix
 #define WIFI_PASS       "fling1234"
 
@@ -125,47 +159,229 @@
 #define LORA_SYNC_WORD    0xF3  // Private network ID — all nodes must match
 
 // ════════════════════════════════════════════════════════════════════════
-// PROTOCOL SENTINELS — must match lib/constants.ts and lib/protocol.ts
+// MESH PROTOCOL CONSTANTS
 // ════════════════════════════════════════════════════════════════════════
-#define DISCOVERY_PING  "##DISCOVERY_PING##"
-#define DISCOVERY_PONG  "##DISCOVERY_PONG##"
 
-// ════════════════════════════════════════════════════════════════════════
-// TIMING CONSTANTS (all non-blocking — no delay() in main loop)
-// ════════════════════════════════════════════════════════════════════════
-#define ACK_DELAY_MS          60   // wait before sending ACK (sender exits TX)
-#define PONG_DELAY_MIN_MS     50   // PONG random delay range (collision avoidance)
-#define PONG_DELAY_MAX_MS    150
+#define NODE_ID_LEN        8     // fixed-width address field, in bytes
+#define MAX_PAYLOAD       180    // max text bytes per packet
+#define BROADCAST_ID      "*"    // destination meaning "everyone"
 
-// ── v5: SOS repeat reliability ────────────────────────────────────────
+// ── Packet types ────────────────────────────────────────────────────────
+#define PKT_DATA             1
+#define PKT_ACK              2
+#define PKT_HELLO            3
+#define PKT_RREQ             4
+#define PKT_RREP             5
+#define PKT_DISCOVER         6
+#define PKT_DISCOVER_REPLY   7
+
+// ── Priorities (higher number = sent first) ─────────────────────────────
+#define PRIO_NORMAL    0   // ordinary chat
+#define PRIO_CONTROL   1   // HELLO / RREQ / RREP / ACK / DISCOVER*
+#define PRIO_SOS       2   // emergency broadcast — always wins
+
+// ── Mesh sizing/timing (tuned for a small demo mesh, room to grow) ──────
+#define MESH_TTL_MAX            6     // max hops a packet may travel
+#define MAX_NEIGHBORS           8
+#define MAX_ROUTES              8
+#define MAX_SEEN                24    // de-duplication cache size
+#define MAX_OUTQUEUE             8     // pending-to-transmit slots
+#define MAX_PENDING_ACK          4     // our own unicast sends awaiting ACK
+#define MAX_PENDING_ROUTE        2     // sends waiting on route discovery
+
+#define HELLO_INTERVAL_MS     15000   // how often we announce ourselves
+#define NEIGHBOR_EXPIRY_MS     45000   // forget a neighbour after this long
+#define ROUTE_EXPIRY_MS         60000   // forget an unused route after this long
+#define ROUTE_DISCOVERY_TIMEOUT_MS  4000   // give up waiting for a route reply
+#define ACK_TIMEOUT_MS           1500   // how long to wait for an end-to-end ACK
+#define MAX_SEND_RETRIES            3     // unicast resend attempts before giving up
+#define SEEN_CACHE_EXPIRY_MS    30000   // forget old dedup entries
+
+#define JITTER_UNICAST_MIN_MS      10
+#define JITTER_UNICAST_MAX_MS      60
+#define JITTER_FLOOD_MIN_MS        60
+#define JITTER_FLOOD_MAX_MS       300
+
+// ── v5: SOS repeat reliability (kept from earlier firmware) ────────────
 #define SOS_TOTAL_SENDS       3    // 1 immediate + 2 extra resends
 #define SOS_REPEAT_GAP_MS   250    // base gap between resends (ms)
 
+// ── Battery-aware forwarding ─────────────────────────────────────────────
+// readBatteryPercent() is a stub — wire it to a real ADC voltage divider
+// when the hardware has one. Until then it reports a healthy fixed value
+// so the mesh behaves normally on dev boards with no battery sensor.
+#define LOW_BATTERY_FORWARD_CUTOFF_PCT  20
+
 // ── Multifunction button timing ───────────────────────────────────────
-#define BTN_DEBOUNCE_MS       50   // ignore transitions shorter than this
-#define BTN_DOUBLE_MS        400   // max gap between presses for double-press
-#define BTN_LONG_MS         2000   // hold duration to trigger long-press
+#define BTN_DEBOUNCE_MS       50
+#define BTN_DOUBLE_MS        400
+#define BTN_LONG_MS         2000
 
 // ── LED blink timing ──────────────────────────────────────────────────
-#define LED_YELLOW_SCAN_MS   800   // slow blink period while scanning (ms)
-#define LED_YELLOW_WARN_MS   200   // fast blink period when no client / reconnect
-#define LED_GREEN_CONFIRM_MS 300   // blink period for TX/RX confirmation
-#define LED_RED_EMERG_MS     150   // fast blink period for emergency
+#define LED_YELLOW_SCAN_MS   800
+#define LED_YELLOW_WARN_MS   200
+#define LED_GREEN_CONFIRM_MS 300
+#define LED_RED_EMERG_MS     150
 
 // ════════════════════════════════════════════════════════════════════════
-// LED STATE MACHINE
-//
-// HOW IT WORKS:
-//   Instead of calling LED functions everywhere, all code sets a "desired
-//   LED state" using setLedState(). The main loop's ledUpdate() function
-//   reads that state and drives the pins accordingly.
-//
-//   PRIORITY (highest wins):
-//     LED_CRITICAL > LED_EMERGENCY > LED_WARNING > LED_SCANNING > LED_NORMAL
-//
-//   This means if an emergency arrives while scanning, the red emergency
-//   state will immediately take over. When the emergency blink finishes,
-//   the next-highest active state resumes automatically.
+// MESH PACKET HEADER — byte offsets (see big comment block at top of file)
+// ════════════════════════════════════════════════════════════════════════
+#define OFF_TYPE          0
+#define OFF_MSGID         1                          // 2 bytes
+#define OFF_SRC           3                          // NODE_ID_LEN bytes
+#define OFF_DST           (OFF_SRC + NODE_ID_LEN)
+#define OFF_PREVHOP       (OFF_DST + NODE_ID_LEN)
+#define OFF_TTL           (OFF_PREVHOP + NODE_ID_LEN)
+#define OFF_HOP           (OFF_TTL + 1)
+#define OFF_PRIORITY      (OFF_HOP + 1)
+#define OFF_PAYLOADLEN    (OFF_PRIORITY + 1)
+#define HEADER_SIZE       (OFF_PAYLOADLEN + 1)        // = 31 bytes
+#define MAX_PACKET_SIZE   (HEADER_SIZE + MAX_PAYLOAD)
+
+// A decoded header, in friendly C++ form (used everywhere except the
+// raw on-the-wire bytes).
+struct MeshHeader {
+  uint8_t  type;
+  uint16_t msgId;
+  char     src[NODE_ID_LEN + 1];
+  char     dst[NODE_ID_LEN + 1];
+  char     prevHop[NODE_ID_LEN + 1];
+  uint8_t  ttl;
+  uint8_t  hop;
+  uint8_t  priority;
+  uint8_t  payloadLen;
+};
+
+// Write a NodeID string into a fixed NODE_ID_LEN field, zero-padded.
+static void writeId(uint8_t* buf, int offset, const char* id) {
+  memset(buf + offset, 0, NODE_ID_LEN);
+  size_t len = strlen(id);
+  if (len > NODE_ID_LEN) len = NODE_ID_LEN;
+  memcpy(buf + offset, id, len);
+}
+
+// Read a fixed NODE_ID_LEN field back into a null-terminated string.
+static void readId(const uint8_t* buf, int offset, char* out) {
+  memcpy(out, buf + offset, NODE_ID_LEN);
+  out[NODE_ID_LEN] = '\0';
+}
+
+// Pack a MeshHeader struct into the on-the-wire byte layout.
+static void encodeHeader(const MeshHeader& h, uint8_t* buf) {
+  buf[OFF_TYPE] = h.type;
+  buf[OFF_MSGID]     = (uint8_t)(h.msgId >> 8);
+  buf[OFF_MSGID + 1] = (uint8_t)(h.msgId & 0xFF);
+  writeId(buf, OFF_SRC,     h.src);
+  writeId(buf, OFF_DST,     h.dst);
+  writeId(buf, OFF_PREVHOP, h.prevHop);
+  buf[OFF_TTL]        = h.ttl;
+  buf[OFF_HOP]        = h.hop;
+  buf[OFF_PRIORITY]   = h.priority;
+  buf[OFF_PAYLOADLEN] = h.payloadLen;
+}
+
+// Unpack the on-the-wire byte layout into a MeshHeader struct.
+static void decodeHeader(const uint8_t* buf, MeshHeader& h) {
+  h.type  = buf[OFF_TYPE];
+  h.msgId = ((uint16_t)buf[OFF_MSGID] << 8) | buf[OFF_MSGID + 1];
+  readId(buf, OFF_SRC,     h.src);
+  readId(buf, OFF_DST,     h.dst);
+  readId(buf, OFF_PREVHOP, h.prevHop);
+  h.ttl        = buf[OFF_TTL];
+  h.hop        = buf[OFF_HOP];
+  h.priority   = buf[OFF_PRIORITY];
+  h.payloadLen = buf[OFF_PAYLOADLEN];
+}
+
+static bool isBroadcastAddr(const char* id) {
+  return strcmp(id, BROADCAST_ID) == 0;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// MESH TABLES
+// ════════════════════════════════════════════════════════════════════════
+
+// ── Neighbor table: nodes we can hear directly (built from ANY heard
+//    packet's prevHop field, not just HELLO beacons — "opportunistic
+//    learning"). Used for diagnostics and battery-aware reporting. ─────
+struct NeighborEntry {
+  bool          inUse;
+  char          id[NODE_ID_LEN + 1];
+  unsigned long lastHeard;
+  int16_t       rssi;
+  float         snr;
+  uint8_t       battery;
+};
+NeighborEntry neighbors[MAX_NEIGHBORS];
+
+// ── Route table: "to reach <dest>, send to <nextHop>". Built reactively
+//    by RREQ/RREP (and by DISCOVER, which doubles as a free route
+//    discovery for whoever sent it). ──────────────────────────────────
+struct RouteEntry {
+  bool          valid;
+  char          dest[NODE_ID_LEN + 1];
+  char          nextHop[NODE_ID_LEN + 1];
+  uint8_t       hopCount;
+  unsigned long lastUsed;
+};
+RouteEntry routes[MAX_ROUTES];
+
+// ── Seen cache: de-duplication. Every packet is identified by
+//    (originalSource, msgId). If we've processed it before, drop the
+//    repeat — this is what prevents routing loops and broadcast storms
+//    from flooding forever. ───────────────────────────────────────────
+struct SeenEntry {
+  bool          inUse;
+  char          src[NODE_ID_LEN + 1];
+  uint16_t      msgId;
+  unsigned long ts;
+};
+SeenEntry seenCache[MAX_SEEN];
+
+// ── Outgoing queue: every packet we transmit (our own + forwarded)
+//    passes through here so we can apply priority ordering and
+//    collision-avoiding jitter instead of transmitting immediately. ───
+struct OutQueueItem {
+  bool          inUse;
+  uint8_t       buf[MAX_PACKET_SIZE];
+  uint8_t       len;
+  uint8_t       priority;
+  unsigned long sendAt;       // don't transmit before this time (jitter)
+  unsigned long queuedAt;
+};
+OutQueueItem outQueue[MAX_OUTQUEUE];
+
+// ── Pending end-to-end ACKs: unicast messages WE originated (from our
+//    own phone) that are waiting for the destination's ACK. Resent on
+//    timeout; route is invalidated and rediscovered after too many
+//    failures (this is the "node failure recovery" mechanism). ────────
+struct PendingAckItem {
+  bool          inUse;
+  uint16_t      msgId;
+  char          dest[NODE_ID_LEN + 1];
+  uint8_t       buf[MAX_PACKET_SIZE];
+  uint8_t       len;
+  uint8_t       retriesLeft;
+  unsigned long nextRetryAt;
+};
+PendingAckItem pendingAcks[MAX_PENDING_ACK];
+
+// ── Pending route discovery: a phone-originated unicast send that had
+//    no known route yet. We hold the original packet, fire an RREQ, and
+//    flush it the moment an RREP arrives (or report failure on timeout).
+struct PendingRouteItem {
+  bool          inUse;
+  char          dest[NODE_ID_LEN + 1];
+  uint8_t       buf[MAX_PACKET_SIZE];
+  uint8_t       len;
+  unsigned long requestedAt;
+};
+PendingRouteItem pendingRoutes[MAX_PENDING_ROUTE];
+
+uint16_t nextMsgId = 1;   // incremented for every packet WE originate
+
+// ════════════════════════════════════════════════════════════════════════
+// LED STATE MACHINE  (unchanged behaviour from v7)
 // ════════════════════════════════════════════════════════════════════════
 
 enum LedState {
@@ -179,143 +395,49 @@ enum LedState {
 LedState currentLedState   = LED_NORMAL;
 LedState requestedLedState = LED_NORMAL;
 
-// ── Green confirm blink (runs in parallel on top of normal state) ──────
-// A short 3-blink confirmation plays on the green LED when an ACK arrives,
-// without changing the main LED state machine.
 int           greenBlinkCount = 0;
 bool          greenBlinkOn    = false;
 unsigned long greenBlinkNext  = 0;
 
-// ── Red emergency blink (time-limited, then returns to prior state) ────
 int           redBlinkCount   = 0;
 bool          redBlinkOn      = false;
 unsigned long redBlinkNext    = 0;
-LedState      stateAfterEmerg = LED_NORMAL; // restore after emergency blink
+LedState      stateAfterEmerg = LED_NORMAL;
 
-// ── Yellow blink timer ─────────────────────────────────────────────────
 bool          yellowBlinkOn   = false;
 unsigned long yellowBlinkNext = 0;
 
-// ════════════════════════════════════════════════════════════════════════
-// GLOBALS
-// ════════════════════════════════════════════════════════════════════════
+void setLedState(LedState s) { requestedLedState = s; }
 
-WebSocketsServer webSocket = WebSocketsServer(8765);
-StaticJsonDocument<512> doc;
-
-uint8_t       connectedClients = 0;
-unsigned int  msgSent          = 0;
-unsigned int  msgReceived      = 0;
-unsigned long lastMsgTime      = 0;
-
-// ── SOS button state (edge detection — DO NOT CHANGE) ─────────────────
-bool lastSosState  = HIGH;
-
-// ── Non-blocking ACK ──────────────────────────────────────────────────
-bool          pendingAck       = false;
-String        pendingAckTarget = "";
-unsigned long pendingAckTime   = 0;
-
-// ── Non-blocking PONG ─────────────────────────────────────────────────
-bool          pendingPong       = false;
-String        pendingPongTarget = "";
-unsigned long pendingPongTime   = 0;
-
-// ── v5: Non-blocking SOS re-broadcast ────────────────────────────────
-String        sosRepeatPacket = "";
-int           sosRepeatsLeft  = 0;
-unsigned long sosRepeatNext   = 0;
-
-// ── Scanning state ────────────────────────────────────────────────────
-bool          isScanning = false;   // true while a discovery scan is active
-
-// ════════════════════════════════════════════════════════════════════════
-// MULTIFUNCTION BUTTON STATE MACHINE
-//
-// HOW IT WORKS (non-blocking):
-//   The button is checked every loop iteration (not on a slow timer).
-//   A small state machine tracks:
-//     1. Raw debounce: ignore transitions < BTN_DEBOUNCE_MS (electrical noise)
-//     2. Press timing: remember when the press started
-//     3. Release timing: decide single vs double vs long on release
-//
-//   State flow:
-//     IDLE → PRESSED (falling edge, debounce starts)
-//     PRESSED → HELD (debounce cleared, counting hold time)
-//     HELD → RELEASED → decide action:
-//       • was held ≥ BTN_LONG_MS    → long press
-//       • released quickly           → start a "wait for double" window
-//     WAIT_DOUBLE → PRESSED again within BTN_DOUBLE_MS → double press
-//     WAIT_DOUBLE → timeout without second press       → single press
-// ════════════════════════════════════════════════════════════════════════
-
-enum BtnMachineState {
-  BTN_IDLE,
-  BTN_DEBOUNCING,
-  BTN_HELD,
-  BTN_WAIT_DOUBLE
-};
-
-BtnMachineState userBtnState    = BTN_IDLE;
-bool            userBtnLastRaw  = HIGH;   // last raw pin reading
-unsigned long   userBtnEdgeTime = 0;      // when the last edge was seen
-unsigned long   userBtnPressTime= 0;      // when debounce-confirmed press started
-unsigned long   userBtnReleaseTime = 0;   // when release was confirmed
-
-// ════════════════════════════════════════════════════════════════════════
-// LED STATE MACHINE — IMPLEMENTATION
-// ════════════════════════════════════════════════════════════════════════
-
-// Call this to request a new LED state. The update function enforces priority.
-void setLedState(LedState s) {
-  requestedLedState = s;
-}
-
-// Trigger a short green confirmation blink (3 blinks) — used on ACK received.
-// Runs on top of the main LED state; does NOT change currentLedState.
 void triggerGreenConfirm() {
-  greenBlinkCount = 6;   // 6 transitions = 3 full on/off blinks
+  greenBlinkCount = 6;
   greenBlinkOn    = false;
   greenBlinkNext  = millis();
 }
 
-// Trigger a time-limited red emergency blink (5 blinks), then auto-restore.
 void triggerEmergencyBlink() {
-  stateAfterEmerg = requestedLedState;  // remember what to go back to
+  stateAfterEmerg = requestedLedState;
   setLedState(LED_EMERGENCY);
-  redBlinkCount = 10;  // 10 transitions = 5 full on/off blinks
+  redBlinkCount = 10;
   redBlinkOn    = true;
   redBlinkNext  = millis();
   digitalWrite(LED_RED, HIGH);
 }
 
-// Called once per loop() — drives all three LED pins based on current state.
 void ledUpdate() {
   unsigned long now = millis();
 
-  // ── Resolve priority: highest-priority active state wins ──
-  // LED_CRITICAL is set once in setup and never overridden.
   if (currentLedState != LED_CRITICAL) {
     currentLedState = requestedLedState;
   }
 
-  // ── Drive LEDs based on current state ──────────────────────
   switch (currentLedState) {
-
-    // ── NORMAL: Green solid, Yellow off, Red off ──────────────
     case LED_NORMAL:
-      // Only set green if a confirm-blink is not running
-      if (greenBlinkCount == 0) {
-        digitalWrite(LED_GREEN, HIGH);
-      }
+      if (greenBlinkCount == 0) digitalWrite(LED_GREEN, HIGH);
       digitalWrite(LED_YELLOW, LOW);
-      // Red off — but only if no emergency blink is in progress
-      if (redBlinkCount == 0) {
-        digitalWrite(LED_RED, LOW);
-      }
+      if (redBlinkCount == 0) digitalWrite(LED_RED, LOW);
       break;
 
-    // ── SCANNING: Yellow slow blink, Green off, Red off ───────
     case LED_SCANNING:
       digitalWrite(LED_GREEN, LOW);
       if (redBlinkCount == 0) digitalWrite(LED_RED, LOW);
@@ -326,7 +448,6 @@ void ledUpdate() {
       }
       break;
 
-    // ── WARNING: Yellow fast blink, Green off, Red off ────────
     case LED_WARNING:
       digitalWrite(LED_GREEN, LOW);
       if (redBlinkCount == 0) digitalWrite(LED_RED, LOW);
@@ -337,7 +458,6 @@ void ledUpdate() {
       }
       break;
 
-    // ── EMERGENCY: Red fast blink (time-limited) ───────────────
     case LED_EMERGENCY:
       digitalWrite(LED_GREEN, LOW);
       digitalWrite(LED_YELLOW, LOW);
@@ -347,14 +467,12 @@ void ledUpdate() {
         digitalWrite(LED_RED, redBlinkOn ? HIGH : LOW);
         redBlinkNext = now + LED_RED_EMERG_MS;
         if (redBlinkCount == 0) {
-          // Emergency blink finished — restore previous state
           digitalWrite(LED_RED, LOW);
           setLedState(stateAfterEmerg);
         }
       }
       break;
 
-    // ── CRITICAL: Red solid, everything else off ───────────────
     case LED_CRITICAL:
       digitalWrite(LED_GREEN, LOW);
       digitalWrite(LED_YELLOW, LOW);
@@ -362,15 +480,11 @@ void ledUpdate() {
       break;
   }
 
-  // ── Green confirmation blink (overlaid on top of any state) ──
-  // Blinks the green LED briefly to confirm a message was delivered (ACK).
-  // Uses its own counter and does not disturb the main state.
   if (greenBlinkCount > 0 && now >= greenBlinkNext) {
     greenBlinkCount--;
     greenBlinkOn = !greenBlinkOn;
     digitalWrite(LED_GREEN, greenBlinkOn ? HIGH : LOW);
     greenBlinkNext = now + LED_GREEN_CONFIRM_MS;
-    // When the blink sequence ends, restore green to the correct level
     if (greenBlinkCount == 0) {
       bool greenShouldBeOn = (currentLedState == LED_NORMAL);
       digitalWrite(LED_GREEN, greenShouldBeOn ? HIGH : LOW);
@@ -379,60 +493,628 @@ void ledUpdate() {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// MULTIFUNCTION BUTTON — IMPLEMENTATION
-//
-// Actions and why they were chosen:
-//   SINGLE PRESS → start/stop scan
-//     Most common need in the field. Quick and obvious. Toggling means a
-//     second press cleanly cancels a scan that already found everyone.
-//
-//   DOUBLE PRESS → reconnect / reset comms
-//     Used when the link feels stale. Double-press is intentional (hard to
-//     do by accident) and fast to perform. Fires a new scan + clears state.
-//
-//   LONG PRESS (≥2 s) → restart node
-//     Reserved for "something is really wrong" situations. Long press is
-//     hard to trigger accidentally and gives time to change your mind.
+// GLOBALS
 // ════════════════════════════════════════════════════════════════════════
 
-// ── Action handlers (called by the state machine) ──────────────────────
+WebSocketsServer webSocket = WebSocketsServer(8765);
+StaticJsonDocument<512> doc;
+
+uint8_t       connectedClients   = 0;
+unsigned int  msgSent            = 0;
+unsigned int  msgReceived        = 0;
+unsigned int  pktForwarded       = 0;
+unsigned int  pktDroppedDup      = 0;
+unsigned int  pktDroppedNoRoute  = 0;
+unsigned int  routeDiscoveries   = 0;
+unsigned long lastMsgTime        = 0;
+
+bool lastSosState  = HIGH;
+
+bool          isScanning = false;
+
+int           sosRepeatsLeft  = 0;
+unsigned long sosRepeatNext   = 0;
+uint8_t       sosRepeatBuf[MAX_PACKET_SIZE];  // raw mesh bytes of the last SOS, for resends
+uint8_t       sosRepeatLen    = 0;
+
+unsigned long lastHelloAt = 0;
+
+// ════════════════════════════════════════════════════════════════════════
+// BATTERY (stub — wire to real ADC when hardware supports it)
+// ════════════════════════════════════════════════════════════════════════
+uint8_t readBatteryPercent() {
+  // No fuel-gauge wired on the dev boards used for this demo.
+  // Returning a healthy fixed value keeps mesh behaviour realistic
+  // (no false low-battery no-forward) until real ADC code is added,
+  // e.g.: int mv = analogReadMilliVolts(BATTERY_ADC_PIN); ...
+  return 100;
+}
+
+bool forwardingAllowed() {
+  return readBatteryPercent() >= LOW_BATTERY_FORWARD_CUTOFF_PCT;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// TABLE HELPERS
+// ════════════════════════════════════════════════════════════════════════
+
+void addOrUpdateNeighbor(const char* id, int16_t rssi, float snr) {
+  unsigned long now = millis();
+  int freeSlot = -1;
+  for (int i = 0; i < MAX_NEIGHBORS; i++) {
+    if (neighbors[i].inUse && strcmp(neighbors[i].id, id) == 0) {
+      neighbors[i].lastHeard = now;
+      neighbors[i].rssi = rssi;
+      neighbors[i].snr  = snr;
+      return;
+    }
+    if (!neighbors[i].inUse && freeSlot < 0) freeSlot = i;
+    // Recycle the stalest expired entry if the table is full.
+    if (neighbors[i].inUse && (now - neighbors[i].lastHeard) > NEIGHBOR_EXPIRY_MS) {
+      freeSlot = i;
+    }
+  }
+  if (freeSlot < 0) freeSlot = 0; // table genuinely full — overwrite oldest slot
+  neighbors[freeSlot].inUse     = true;
+  strncpy(neighbors[freeSlot].id, id, NODE_ID_LEN); neighbors[freeSlot].id[NODE_ID_LEN] = '\0';
+  neighbors[freeSlot].lastHeard = now;
+  neighbors[freeSlot].rssi      = rssi;
+  neighbors[freeSlot].snr       = snr;
+}
+
+void setNeighborBattery(const char* id, uint8_t battery) {
+  for (int i = 0; i < MAX_NEIGHBORS; i++) {
+    if (neighbors[i].inUse && strcmp(neighbors[i].id, id) == 0) {
+      neighbors[i].battery = battery;
+      return;
+    }
+  }
+}
+
+// Returns a pointer to a valid route for dest, or nullptr if none known.
+RouteEntry* findRoute(const char* dest) {
+  for (int i = 0; i < MAX_ROUTES; i++) {
+    if (routes[i].valid && strcmp(routes[i].dest, dest) == 0) {
+      if (millis() - routes[i].lastUsed > ROUTE_EXPIRY_MS) {
+        routes[i].valid = false;   // stale — force fresh discovery
+        continue;
+      }
+      return &routes[i];
+    }
+  }
+  return nullptr;
+}
+
+void addOrUpdateRoute(const char* dest, const char* nextHop, uint8_t hopCount) {
+  int freeSlot = -1;
+  for (int i = 0; i < MAX_ROUTES; i++) {
+    if (routes[i].valid && strcmp(routes[i].dest, dest) == 0) {
+      // Prefer the shorter (or freshest equal-length) path.
+      if (hopCount <= routes[i].hopCount) {
+        strncpy(routes[i].nextHop, nextHop, NODE_ID_LEN); routes[i].nextHop[NODE_ID_LEN] = '\0';
+        routes[i].hopCount = hopCount;
+      }
+      routes[i].lastUsed = millis();
+      return;
+    }
+    if (!routes[i].valid && freeSlot < 0) freeSlot = i;
+  }
+  if (freeSlot < 0) freeSlot = 0; // table full — overwrite oldest
+  routes[freeSlot].valid    = true;
+  strncpy(routes[freeSlot].dest, dest, NODE_ID_LEN); routes[freeSlot].dest[NODE_ID_LEN] = '\0';
+  strncpy(routes[freeSlot].nextHop, nextHop, NODE_ID_LEN); routes[freeSlot].nextHop[NODE_ID_LEN] = '\0';
+  routes[freeSlot].hopCount = hopCount;
+  routes[freeSlot].lastUsed = millis();
+}
+
+void invalidateRoute(const char* dest) {
+  for (int i = 0; i < MAX_ROUTES; i++) {
+    if (routes[i].valid && strcmp(routes[i].dest, dest) == 0) {
+      routes[i].valid = false;
+    }
+  }
+}
+
+bool hasSeen(const char* src, uint16_t msgId) {
+  unsigned long now = millis();
+  for (int i = 0; i < MAX_SEEN; i++) {
+    if (seenCache[i].inUse && (now - seenCache[i].ts) > SEEN_CACHE_EXPIRY_MS) {
+      seenCache[i].inUse = false; // lazily expire old entries
+    }
+    if (seenCache[i].inUse && seenCache[i].msgId == msgId &&
+        strcmp(seenCache[i].src, src) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void markSeen(const char* src, uint16_t msgId) {
+  int freeSlot = -1;
+  for (int i = 0; i < MAX_SEEN; i++) {
+    if (!seenCache[i].inUse) { freeSlot = i; break; }
+  }
+  if (freeSlot < 0) freeSlot = 0; // full — overwrite oldest
+  seenCache[freeSlot].inUse = true;
+  strncpy(seenCache[freeSlot].src, src, NODE_ID_LEN); seenCache[freeSlot].src[NODE_ID_LEN] = '\0';
+  seenCache[freeSlot].msgId = msgId;
+  seenCache[freeSlot].ts    = millis();
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// SEND QUEUE
+// ════════════════════════════════════════════════════════════════════════
+
+// Queue a fully-encoded packet for transmission. isFlood=true applies a
+// wider random jitter window (broadcast/RREQ/DISCOVER-style traffic,
+// where many neighbours might react at once — this is our collision
+// avoidance). Point-to-point traffic gets a smaller jitter.
+bool enqueueRaw(const uint8_t* buf, uint8_t len, uint8_t priority, bool isFlood) {
+  int freeSlot = -1;
+  for (int i = 0; i < MAX_OUTQUEUE; i++) {
+    if (!outQueue[i].inUse) { freeSlot = i; break; }
+  }
+  if (freeSlot < 0) return false; // queue full — congestion; drop and let retry/backoff handle it
+
+  unsigned long jitter = isFlood
+    ? JITTER_FLOOD_MIN_MS   + random(JITTER_FLOOD_MAX_MS   - JITTER_FLOOD_MIN_MS)
+    : JITTER_UNICAST_MIN_MS + random(JITTER_UNICAST_MAX_MS - JITTER_UNICAST_MIN_MS);
+
+  memcpy(outQueue[freeSlot].buf, buf, len);
+  outQueue[freeSlot].len      = len;
+  outQueue[freeSlot].priority = priority;
+  outQueue[freeSlot].inUse    = true;
+  outQueue[freeSlot].queuedAt = millis();
+  outQueue[freeSlot].sendAt   = millis() + jitter;
+  return true;
+}
+
+bool enqueuePacket(const MeshHeader& h, const uint8_t* payload, bool isFlood) {
+  uint8_t buf[MAX_PACKET_SIZE];
+  encodeHeader(h, buf);
+  if (h.payloadLen > 0) memcpy(buf + HEADER_SIZE, payload, h.payloadLen);
+  return enqueueRaw(buf, HEADER_SIZE + h.payloadLen, h.priority, isFlood);
+}
+
+// Called every loop() — picks the highest-priority ready item and
+// actually keys up the radio. Only one packet goes out at a time since
+// LoRa is a single half-duplex radio (this is our congestion control:
+// SOS-priority traffic always wins the slot first).
+void drainOutQueue() {
+  unsigned long now = millis();
+  int best = -1;
+  for (int i = 0; i < MAX_OUTQUEUE; i++) {
+    if (!outQueue[i].inUse) continue;
+    if (outQueue[i].sendAt > now) continue;
+    if (best < 0 ||
+        outQueue[i].priority >  outQueue[best].priority ||
+        (outQueue[i].priority == outQueue[best].priority &&
+         outQueue[i].queuedAt < outQueue[best].queuedAt)) {
+      best = i;
+    }
+  }
+  if (best < 0) return;
+
+  LoRa.beginPacket();
+  LoRa.write(outQueue[best].buf, outQueue[best].len);
+  LoRa.endPacket();
+  msgSent++;
+
+  digitalWrite(LED_YELLOW, HIGH); delay(20); digitalWrite(LED_YELLOW, LOW);
+
+  outQueue[best].inUse = false;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// WEBSOCKET BROADCAST  (to the one phone connected to this node)
+// ════════════════════════════════════════════════════════════════════════
+
+void wsBroadcast(const String& json) {
+  if (connectedClients > 0) webSocket.broadcastTXT(json);
+}
+
+void deliverMessageToPhone(const char* sender, const char* data, bool broadcast,
+                            int16_t rssi, float snr) {
+  doc.clear();
+  doc["type"]   = "message";
+  doc["sender"] = sender;
+  doc["data"]   = data;
+  doc["rssi"]   = rssi;
+  doc["snr"]    = snr;
+  if (broadcast) doc["broadcast"] = true;
+  String out; serializeJson(doc, out);
+  wsBroadcast(out);
+}
+
+void reportDeliveryFailed(const char* dest) {
+  // [NEW in v8] Additive frame — old app builds simply ignore unknown
+  // status values, so this is safe to add without breaking compatibility.
+  doc.clear();
+  doc["type"] = "delivery";
+  doc["status"] = "failed";
+  doc["dest"] = dest;
+  String out; serializeJson(doc, out);
+  wsBroadcast(out);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// SENDING HELPERS — build + queue packets for each packet type
+// ════════════════════════════════════════════════════════════════════════
+
+MeshHeader makeHeader(uint8_t type, const char* dst, uint8_t priority, uint8_t payloadLen) {
+  MeshHeader h;
+  h.type = type;
+  h.msgId = nextMsgId++;
+  strncpy(h.src, THIS_DEVICE_ID, NODE_ID_LEN); h.src[NODE_ID_LEN] = '\0';
+  strncpy(h.dst, dst, NODE_ID_LEN); h.dst[NODE_ID_LEN] = '\0';
+  strncpy(h.prevHop, THIS_DEVICE_ID, NODE_ID_LEN); h.prevHop[NODE_ID_LEN] = '\0';
+  h.ttl = MESH_TTL_MAX;
+  h.hop = 0;
+  h.priority = priority;
+  h.payloadLen = payloadLen;
+  return h;
+}
+
+void sendHello() {
+  MeshHeader h = makeHeader(PKT_HELLO, BROADCAST_ID, PRIO_CONTROL, 1);
+  h.ttl = 1; // HELLO is direct-neighbour-only — never forwarded
+  uint8_t payload[1] = { readBatteryPercent() };
+  enqueuePacket(h, payload, true);
+}
+
+void sendRREQ(const char* dest) {
+  MeshHeader h = makeHeader(PKT_RREQ, dest, PRIO_CONTROL, 0);
+  enqueuePacket(h, nullptr, true);
+  routeDiscoveries++;
+}
+
+void sendDiscoverFlood() {
+  MeshHeader h = makeHeader(PKT_DISCOVER, BROADCAST_ID, PRIO_CONTROL, 0);
+  enqueuePacket(h, nullptr, true);
+}
+
+// Generic "forward this packet on, unchanged content, one hop further"
+// used for DATA/ACK/RREP unicast forwarding and for broadcast/RREQ/
+// DISCOVER flood rebroadcast. Decrements TTL and stamps prevHop=us.
+bool forwardPacket(MeshHeader h, const uint8_t* payload, bool isFlood) {
+  if (!forwardingAllowed()) return false; // battery-aware: stop relaying for others
+  if (h.ttl == 0) return false;
+  h.ttl--;
+  h.hop++;
+  strncpy(h.prevHop, THIS_DEVICE_ID, NODE_ID_LEN); h.prevHop[NODE_ID_LEN] = '\0';
+  bool ok = enqueuePacket(h, payload, isFlood);
+  if (ok) pktForwarded++;
+  return ok;
+}
+
+// Forward a unicast packet toward h.dst using the route table. Returns
+// false (and drops the packet) if no route is currently known — this
+// only happens mid-mesh if a route went stale after the sender already
+// committed to it; the sender's own ACK-retry logic will notice and
+// trigger fresh discovery.
+bool forwardUnicast(MeshHeader h, const uint8_t* payload) {
+  RouteEntry* r = findRoute(h.dst);
+  if (!r) { pktDroppedNoRoute++; return false; }
+  r->lastUsed = millis();
+  return forwardPacket(h, payload, false);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// END-TO-END RELIABILITY: pending ACK + pending route-discovery tables
+// ════════════════════════════════════════════════════════════════════════
+
+void addPendingAck(uint16_t msgId, const char* dest, const uint8_t* buf, uint8_t len) {
+  int freeSlot = -1;
+  for (int i = 0; i < MAX_PENDING_ACK; i++) {
+    if (!pendingAcks[i].inUse) { freeSlot = i; break; }
+  }
+  if (freeSlot < 0) freeSlot = 0; // table full — overwrite oldest, best-effort
+  pendingAcks[freeSlot].inUse       = true;
+  pendingAcks[freeSlot].msgId       = msgId;
+  strncpy(pendingAcks[freeSlot].dest, dest, NODE_ID_LEN); pendingAcks[freeSlot].dest[NODE_ID_LEN] = '\0';
+  memcpy(pendingAcks[freeSlot].buf, buf, len);
+  pendingAcks[freeSlot].len         = len;
+  pendingAcks[freeSlot].retriesLeft = MAX_SEND_RETRIES;
+  pendingAcks[freeSlot].nextRetryAt = millis() + ACK_TIMEOUT_MS;
+}
+
+void resolvePendingAck(const char* dest, uint16_t msgId) {
+  for (int i = 0; i < MAX_PENDING_ACK; i++) {
+    if (pendingAcks[i].inUse && pendingAcks[i].msgId == msgId &&
+        strcmp(pendingAcks[i].dest, dest) == 0) {
+      pendingAcks[i].inUse = false;
+    }
+  }
+}
+
+void pendingAckTick() {
+  unsigned long now = millis();
+  for (int i = 0; i < MAX_PENDING_ACK; i++) {
+    if (!pendingAcks[i].inUse) continue;
+    if (now < pendingAcks[i].nextRetryAt) continue;
+
+    if (pendingAcks[i].retriesLeft == 0) {
+      // Exhausted retries — the destination (or the path to it) is gone.
+      invalidateRoute(pendingAcks[i].dest);
+      reportDeliveryFailed(pendingAcks[i].dest);
+      pendingAcks[i].inUse = false;
+      continue;
+    }
+    pendingAcks[i].retriesLeft--;
+    pendingAcks[i].nextRetryAt = now + ACK_TIMEOUT_MS;
+    enqueueRaw(pendingAcks[i].buf, pendingAcks[i].len, PRIO_NORMAL, false);
+  }
+}
+
+void addPendingRoute(const char* dest, const uint8_t* buf, uint8_t len) {
+  int freeSlot = -1;
+  for (int i = 0; i < MAX_PENDING_ROUTE; i++) {
+    if (!pendingRoutes[i].inUse) { freeSlot = i; break; }
+  }
+  if (freeSlot < 0) freeSlot = 0;
+  pendingRoutes[freeSlot].inUse = true;
+  strncpy(pendingRoutes[freeSlot].dest, dest, NODE_ID_LEN); pendingRoutes[freeSlot].dest[NODE_ID_LEN] = '\0';
+  memcpy(pendingRoutes[freeSlot].buf, buf, len);
+  pendingRoutes[freeSlot].len = len;
+  pendingRoutes[freeSlot].requestedAt = millis();
+  sendRREQ(dest);
+}
+
+void pendingRouteTick() {
+  unsigned long now = millis();
+  for (int i = 0; i < MAX_PENDING_ROUTE; i++) {
+    if (!pendingRoutes[i].inUse) continue;
+
+    RouteEntry* r = findRoute(pendingRoutes[i].dest);
+    if (r) {
+      // Route arrived — flush the buffered message now.
+      MeshHeader h; decodeHeader(pendingRoutes[i].buf, h);
+      addPendingAck(h.msgId, pendingRoutes[i].dest, pendingRoutes[i].buf, pendingRoutes[i].len);
+      enqueueRaw(pendingRoutes[i].buf, pendingRoutes[i].len, PRIO_NORMAL, false);
+      pendingRoutes[i].inUse = false;
+      continue;
+    }
+    if (now - pendingRoutes[i].requestedAt > ROUTE_DISCOVERY_TIMEOUT_MS) {
+      reportDeliveryFailed(pendingRoutes[i].dest);
+      pendingRoutes[i].inUse = false;
+    }
+  }
+}
+
+// Flush a buffered pending-route packet if its destination just became
+// reachable (called right after we learn a new route via RREP).
+void flushPendingRouteFor(const char* dest) {
+  for (int i = 0; i < MAX_PENDING_ROUTE; i++) {
+    if (pendingRoutes[i].inUse && strcmp(pendingRoutes[i].dest, dest) == 0) {
+      MeshHeader h; decodeHeader(pendingRoutes[i].buf, h);
+      addPendingAck(h.msgId, dest, pendingRoutes[i].buf, pendingRoutes[i].len);
+      enqueueRaw(pendingRoutes[i].buf, pendingRoutes[i].len, PRIO_NORMAL, false);
+      pendingRoutes[i].inUse = false;
+    }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// APP-ORIGINATED SEND (the "send"/"beep" WebSocket commands)
+// ════════════════════════════════════════════════════════════════════════
+
+void sendAppMessage(const char* recipient, const char* data) {
+  uint8_t payloadLen = (uint8_t)strlen(data);
+  if (payloadLen > MAX_PAYLOAD) payloadLen = MAX_PAYLOAD;
+
+  bool broadcast = isBroadcastAddr(recipient);
+  uint8_t priority = broadcast ? PRIO_SOS : PRIO_NORMAL;
+
+  MeshHeader h = makeHeader(PKT_DATA, recipient, priority, payloadLen);
+
+  uint8_t buf[MAX_PACKET_SIZE];
+  encodeHeader(h, buf);
+  memcpy(buf + HEADER_SIZE, data, payloadLen);
+  uint8_t totalLen = HEADER_SIZE + payloadLen;
+
+  if (broadcast) {
+    // Broadcasts flood the whole mesh — no ACK (would cause an ACK storm
+    // from every node that ever receives it), but we do resend the same
+    // msgId a few times for extra resilience against single-packet RF
+    // loss, exactly like the original single-hop SOS behaviour.
+    enqueueRaw(buf, totalLen, priority, true);
+    memcpy(sosRepeatBuf, buf, totalLen);
+    sosRepeatLen    = totalLen;
+    sosRepeatsLeft  = SOS_TOTAL_SENDS - 1;
+    sosRepeatNext   = millis() + SOS_REPEAT_GAP_MS;
+    triggerEmergencyBlink();
+    return;
+  }
+
+  RouteEntry* r = findRoute(recipient);
+  if (r) {
+    enqueueRaw(buf, totalLen, priority, false);
+    addPendingAck(h.msgId, recipient, buf, totalLen);
+  } else {
+    // No known route yet — buffer the message and go find one.
+    addPendingRoute(recipient, buf, totalLen);
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// RECEIVE DISPATCH — the heart of the mesh: decide forward / consume / drop
+// ════════════════════════════════════════════════════════════════════════
+
+void sendAck(const char* dest, uint16_t msgId) {
+  MeshHeader h = makeHeader(PKT_ACK, dest, PRIO_CONTROL, 0);
+  h.msgId = msgId; // ACK must carry the ORIGINAL message's ID, not a new one
+  enqueuePacket(h, nullptr, false);
+}
+
+void handleReceivedPacket(const uint8_t* buf, int len, int16_t rssi, float snr) {
+  if (len < HEADER_SIZE) return; // too short to be a valid mesh packet
+
+  MeshHeader h;
+  decodeHeader(buf, h);
+  const uint8_t* payload = buf + HEADER_SIZE;
+
+  if (strcmp(h.src, THIS_DEVICE_ID) == 0) return; // our own echo — ignore
+
+  // Learn about whoever physically relayed this packet to us, from ANY
+  // traffic we overhear (not just HELLO beacons) — "opportunistic"
+  // neighbor discovery, much faster than waiting for the next beacon.
+  addOrUpdateNeighbor(h.prevHop, rssi, snr);
+
+  bool duplicate = hasSeen(h.src, h.msgId);
+
+  // ── Duplicate handling ────────────────────────────────────────────
+  // If we've already processed this exact packet, normally we just drop
+  // it (prevents re-flooding / loops). EXCEPTION: if it's a unicast DATA
+  // packet addressed to us, the sender resending means our ACK got lost
+  // — so we resend just the ACK without re-delivering a duplicate
+  // message to the phone.
+  if (duplicate) {
+    if (h.type == PKT_DATA && strcmp(h.dst, THIS_DEVICE_ID) == 0) {
+      sendAck(h.src, h.msgId);
+    }
+    pktDroppedDup++;
+    return;
+  }
+  markSeen(h.src, h.msgId);
+
+  switch (h.type) {
+
+    case PKT_HELLO: {
+      setNeighborBattery(h.src, payload[0]);
+      break; // TTL=1, never forwarded
+    }
+
+    case PKT_RREQ: {
+      // Learn the reverse path back to whoever is asking.
+      addOrUpdateRoute(h.src, h.prevHop, h.hop);
+
+      if (strcmp(h.dst, THIS_DEVICE_ID) == 0) {
+        // We are the node being searched for — answer with an RREP.
+        MeshHeader rep = makeHeader(PKT_RREP, h.src, PRIO_CONTROL, 0);
+        forwardUnicast(rep, nullptr); // uses the reverse route we just learned
+      } else if (h.ttl > 0) {
+        forwardPacket(h, payload, true); // keep flooding outward
+      }
+      break;
+    }
+
+    case PKT_RREP: {
+      // The RREP's source is the node that was being searched for —
+      // install a FORWARD route to it via whoever sent us this RREP.
+      addOrUpdateRoute(h.src, h.prevHop, h.hop);
+      flushPendingRouteFor(h.src);
+
+      if (strcmp(h.dst, THIS_DEVICE_ID) != 0) {
+        forwardUnicast(h, payload); // relay it on toward the original requester
+      }
+      break;
+    }
+
+    case PKT_DISCOVER: {
+      // Multi-hop "who's out there?" — also doubles as a route discovery
+      // for the requester, exactly like RREQ.
+      addOrUpdateRoute(h.src, h.prevHop, h.hop);
+
+      MeshHeader reply = makeHeader(PKT_DISCOVER_REPLY, h.src, PRIO_CONTROL, 1);
+      uint8_t replyPayload[1] = { (uint8_t)(h.hop + 1) }; // hops from requester to us
+      forwardUnicast(reply, replyPayload);
+
+      if (h.ttl > 0) forwardPacket(h, payload, true);
+      break;
+    }
+
+    case PKT_DISCOVER_REPLY: {
+      if (strcmp(h.dst, THIS_DEVICE_ID) == 0) {
+        doc.clear();
+        doc["type"]     = "discovery";
+        doc["deviceId"] = h.src;
+        doc["rssi"]     = rssi;
+        doc["snr"]      = snr;
+        doc["hops"]     = h.payloadLen > 0 ? payload[0] : h.hop; // additive field
+        String out; serializeJson(doc, out); wsBroadcast(out);
+        if (connectedClients > 0 && !isScanning) setLedState(LED_NORMAL);
+      } else {
+        forwardUnicast(h, payload);
+      }
+      break;
+    }
+
+    case PKT_DATA: {
+      bool broadcast = isBroadcastAddr(h.dst);
+      bool forUs      = broadcast || strcmp(h.dst, THIS_DEVICE_ID) == 0;
+      if (!forUs) { forwardUnicast(h, payload); break; }
+
+      char text[MAX_PAYLOAD + 1];
+      memcpy(text, payload, h.payloadLen);
+      text[h.payloadLen] = '\0';
+
+      msgReceived++; lastMsgTime = millis();
+      deliverMessageToPhone(h.src, text, broadcast, rssi, snr);
+
+      if (strstr(text, "SOS") != nullptr) triggerEmergencyBlink();
+
+      if (broadcast) {
+        if (h.ttl > 0) forwardPacket(h, payload, true); // keep the flood going
+      } else {
+        sendAck(h.src, h.msgId);
+      }
+      break;
+    }
+
+    case PKT_ACK: {
+      if (strcmp(h.dst, THIS_DEVICE_ID) == 0) {
+        resolvePendingAck(h.src, h.msgId);
+        triggerGreenConfirm();
+        doc.clear(); doc["type"] = "delivery"; doc["status"] = "delivered";
+        String out; serializeJson(doc, out); wsBroadcast(out);
+      } else {
+        forwardUnicast(h, payload);
+      }
+      break;
+    }
+
+    default: break;
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// MULTIFUNCTION BUTTON — IMPLEMENTATION (unchanged behaviour, new actions
+// underneath: mesh DISCOVER flood instead of single-hop ping)
+// ════════════════════════════════════════════════════════════════════════
+
+enum BtnMachineState { BTN_IDLE, BTN_DEBOUNCING, BTN_HELD, BTN_WAIT_DOUBLE };
+
+BtnMachineState userBtnState       = BTN_IDLE;
+bool            userBtnLastRaw     = HIGH;
+unsigned long   userBtnEdgeTime    = 0;
+unsigned long   userBtnPressTime   = 0;
+unsigned long   userBtnReleaseTime = 0;
 
 void onUserSinglePress() {
-  Serial.println("[BTN] Single press → toggle scan");
+  Serial.println("[BTN] Single press -> toggle mesh discovery scan");
   if (!isScanning) {
-    // START SCAN
     isScanning = true;
     setLedState(LED_SCANNING);
-    String pkt = String(THIS_DEVICE_ID) + ":*:" + DISCOVERY_PING;
-    LoRa.beginPacket(); LoRa.print(pkt); LoRa.endPacket();
-    Serial.println("[LoRa] Discovery PING sent (scan started)");
-    // Notify the app
+    sendDiscoverFlood();
     doc.clear(); doc["type"] = "discover";
     String out; serializeJson(doc, out); wsBroadcast(out);
   } else {
-    // STOP SCAN
     isScanning = false;
     setLedState((connectedClients > 0) ? LED_NORMAL : LED_WARNING);
-    Serial.println("[BTN] Scan stopped");
   }
 }
 
 void onUserDoublePress() {
-  Serial.println("[BTN] Double press → reconnect / reset comms");
-  // Reset scanning state and fire a fresh discovery ping
+  Serial.println("[BTN] Double press -> reconnect / reset mesh discovery");
   isScanning = true;
   setLedState(LED_SCANNING);
-  String pkt = String(THIS_DEVICE_ID) + ":*:" + DISCOVERY_PING;
-  LoRa.beginPacket(); LoRa.print(pkt); LoRa.endPacket();
-  Serial.println("[LoRa] Re-discovery PING sent");
-  // Tell the app to refresh its node list
+  sendDiscoverFlood();
   doc.clear(); doc["type"] = "reconnect";
   String out; serializeJson(doc, out); wsBroadcast(out);
 }
 
 void onUserLongPress() {
-  Serial.println("[BTN] Long press → restarting node...");
-  // Brief red blink to confirm the restart is about to happen
+  Serial.println("[BTN] Long press -> restarting node...");
   for (int i = 0; i < 6; i++) {
     digitalWrite(LED_RED, HIGH); delay(100);
     digitalWrite(LED_RED, LOW);  delay(100);
@@ -440,68 +1122,51 @@ void onUserLongPress() {
   ESP.restart();
 }
 
-// ── Button polling (call every loop iteration) ──────────────────────────
 void userBtnUpdate() {
-  unsigned long now   = millis();
-  bool          raw   = digitalRead(BTN_USER);   // HIGH = released, LOW = pressed
+  unsigned long now = millis();
+  bool raw = digitalRead(BTN_USER);
 
   switch (userBtnState) {
-
-    // ── Waiting for any press ──────────────────────────────────
     case BTN_IDLE:
       if (raw == LOW && userBtnLastRaw == HIGH) {
-        // Falling edge — start debounce
         userBtnEdgeTime = now;
         userBtnState    = BTN_DEBOUNCING;
       }
       break;
 
-    // ── Absorbing contact bounce ───────────────────────────────
     case BTN_DEBOUNCING:
       if (now - userBtnEdgeTime >= BTN_DEBOUNCE_MS) {
         if (raw == LOW) {
-          // Still pressed after debounce window — confirmed real press
           userBtnPressTime = now;
           userBtnState     = BTN_HELD;
         } else {
-          // Bounced back — false trigger, go back to idle
           userBtnState = BTN_IDLE;
         }
       }
       break;
 
-    // ── Counting hold duration ─────────────────────────────────
     case BTN_HELD:
       if (raw == HIGH) {
-        // Button released — decide single vs long
         unsigned long heldMs = now - userBtnPressTime;
         if (heldMs >= BTN_LONG_MS) {
           onUserLongPress();
           userBtnState = BTN_IDLE;
         } else {
-          // Short press — wait to see if a second press comes (double)
           userBtnReleaseTime = now;
           userBtnState       = BTN_WAIT_DOUBLE;
         }
       }
       break;
 
-    // ── Waiting to see if a second press comes quickly ─────────
     case BTN_WAIT_DOUBLE:
       if (raw == LOW && userBtnLastRaw == HIGH) {
-        // Second press detected within the window → double press
         if (now - userBtnReleaseTime <= BTN_DOUBLE_MS) {
-          userBtnEdgeTime = now;
-          userBtnState    = BTN_DEBOUNCING;   // debounce the second press
-          // Sneaky: we mark this as a "double" by checking the flag below.
-          // Simpler approach: fire immediately and go idle.
           onUserDoublePress();
           userBtnState = BTN_IDLE;
           break;
         }
       }
       if (now - userBtnReleaseTime > BTN_DOUBLE_MS) {
-        // Timeout — no second press; it was a single press
         onUserSinglePress();
         userBtnState = BTN_IDLE;
       }
@@ -512,57 +1177,19 @@ void userBtnUpdate() {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// v5 SOS REPEAT HELPER
+// WEBSOCKET EVENT HANDLER  (JSON contract unchanged from the app's view)
 // ════════════════════════════════════════════════════════════════════════
 
-// Queue up extra resends of an SOS/emergency packet after the first TX.
-void scheduleSosRepeats(const String& packet) {
-  sosRepeatPacket = packet;
-  sosRepeatsLeft  = SOS_TOTAL_SENDS - 1;   // first send already happened
-  sosRepeatNext   = millis() + SOS_REPEAT_GAP_MS;
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// WEBSOCKET BROADCAST
-// ════════════════════════════════════════════════════════════════════════
-
-void wsBroadcast(String json) {
-  if (connectedClients > 0) webSocket.broadcastTXT(json);
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// LORA PACKET PARSER
-// Every packet:  SENDER:RECIPIENT:CONTENT
-// ════════════════════════════════════════════════════════════════════════
-bool parseLoraPacket(const String& raw,
-                     String& sender, String& recipient, String& content) {
-  int a = raw.indexOf(':');
-  if (a < 0) return false;
-  int b = raw.indexOf(':', a + 1);
-  if (b < 0) return false;
-  sender    = raw.substring(0, a);
-  recipient = raw.substring(a + 1, b);
-  content   = raw.substring(b + 1);
-  return (sender.length() > 0 && recipient.length() > 0);
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// WEBSOCKET EVENT HANDLER
-// ════════════════════════════════════════════════════════════════════════
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
 
     case WStype_DISCONNECTED:
       if (connectedClients > 0) connectedClients--;
-      Serial.printf("[WS] Client %u disconnected\n", num);
-      // No app clients left → show warning state (yellow fast blink)
       if (connectedClients == 0) setLedState(LED_WARNING);
       break;
 
     case WStype_CONNECTED: {
       connectedClients++;
-      Serial.printf("[WS] Client %u connected\n", num);
-      // App connected — return to normal state (unless scanning)
       if (!isScanning) setLedState(LED_NORMAL);
       doc.clear();
       doc["type"]            = "device_info";
@@ -584,33 +1211,18 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
       if (strcmp(msgType, "send") == 0) {
         const char* recipient = doc["recipient"] | "*";
         const char* data      = doc["data"]      | "";
-        String pkt = String(THIS_DEVICE_ID) + ":" + recipient + ":" + data;
-        LoRa.beginPacket(); LoRa.print(pkt); LoRa.endPacket();
-        msgSent++;
-        // Yellow quick-blink to show radio activity during TX
-        digitalWrite(LED_YELLOW, HIGH); delay(30); digitalWrite(LED_YELLOW, LOW);
-        if (strcmp(recipient, "*") == 0) {
-          scheduleSosRepeats(pkt);
-          triggerEmergencyBlink();
-        }
-        Serial.printf("[LoRa] TX: %s\n", pkt.c_str());
+        sendAppMessage(recipient, data);
       }
       else if (strcmp(msgType, "beep") == 0) {
         const char* recipient = doc["recipient"] | "*";
-        String pkt = String(THIS_DEVICE_ID) + ":" + recipient + ":BEEP";
-        LoRa.beginPacket(); LoRa.print(pkt); LoRa.endPacket();
-        msgSent++;
-        digitalWrite(LED_YELLOW, HIGH); delay(30); digitalWrite(LED_YELLOW, LOW);
+        sendAppMessage(recipient, "BEEP");
       }
       else if (strcmp(msgType, "discover") == 0) {
         isScanning = true;
         setLedState(LED_SCANNING);
-        String pkt = String(THIS_DEVICE_ID) + ":*:" + DISCOVERY_PING;
-        LoRa.beginPacket(); LoRa.print(pkt); LoRa.endPacket();
-        Serial.println("[LoRa] Discovery PING sent (from app)");
+        sendDiscoverFlood();
       }
       else if (strcmp(msgType, "ping") == 0) {
-        // App-level heartbeat reply
         doc.clear(); doc["type"] = "pong";
         String out; serializeJson(doc, out);
         webSocket.sendTXT(num, out);
@@ -627,45 +1239,36 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
 // ════════════════════════════════════════════════════════════════════════
 void setup() {
   Serial.begin(115200); delay(500);
+  randomSeed(analogRead(0));
 
-  // Button pins — internal pull-up, so pin rests HIGH, goes LOW when pressed
   pinMode(BTN_SOS,    INPUT_PULLUP);
   pinMode(BTN_USER,   INPUT_PULLUP);
 
-  // LED pins
   pinMode(LED_GREEN,  OUTPUT);
   pinMode(LED_YELLOW, OUTPUT);
   pinMode(LED_RED,    OUTPUT);
-
-  // Start with all LEDs off, then set normal state below
   digitalWrite(LED_GREEN,  LOW);
   digitalWrite(LED_YELLOW, LOW);
   digitalWrite(LED_RED,    LOW);
 
-  // Wi-Fi Access Point
   WiFi.mode(WIFI_AP);
   WiFi.softAP(WIFI_SSID, WIFI_PASS);
   Serial.printf("[WiFi] AP: %s  IP: %s\n", WIFI_SSID, WiFi.softAPIP().toString().c_str());
 
-  // WebSocket server
   webSocket.begin();
   webSocket.onEvent(webSocketEvent);
-  // v5: library heartbeat — detects stale/dead app connections
   webSocket.enableHeartbeat(15000, 3000, 2);
   Serial.println("[WS]   Ready on port 8765 (heartbeat on)");
 
-  // LoRa radio
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
   LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
   if (!LoRa.begin(LORA_FREQ)) {
     Serial.println("[LoRa] INIT FAILED — red LED solid");
     setLedState(LED_CRITICAL);
-    // Force drive the red LED right now; the loop will maintain it
     digitalWrite(LED_RED, HIGH);
-    while (true) { delay(1000); }  // halt — nothing else can work
+    while (true) { delay(1000); }
   }
 
-  // v6 radio settings
   LoRa.setTxPower(LORA_TX_POWER, PA_OUTPUT_PA_BOOST_PIN);
   LoRa.setSpreadingFactor(LORA_SF);
   LoRa.setSignalBandwidth(LORA_BW);
@@ -674,9 +1277,8 @@ void setup() {
   LoRa.enableCrc();
   Serial.printf("[LoRa] Ready — %.0fMHz SF%d BW%.0fkHz sync 0x%02X CRC on\n",
                 LORA_FREQ/1e6, LORA_SF, LORA_BW/1e3, LORA_SYNC_WORD);
+  Serial.printf("[MESH] NodeID: %s  TTL max: %d\n", THIS_DEVICE_ID, MESH_TTL_MAX);
 
-  // System is up — no app connected yet → yellow warning blink
-  // (will switch to LED_NORMAL the moment an app connects)
   setLedState(LED_WARNING);
   Serial.println("[SYS]  Boot complete — waiting for app (yellow blink)");
 }
@@ -685,46 +1287,36 @@ void setup() {
 // MAIN LOOP
 // ════════════════════════════════════════════════════════════════════════
 void loop() {
-  webSocket.loop();   // must be called every iteration
+  webSocket.loop();
 
   unsigned long now = millis();
 
-  // ── LED state machine ─────────────────────────────────────────────
   ledUpdate();
-
-  // ── Multifunction button (non-blocking state machine) ─────────────
   userBtnUpdate();
 
-  // ── Deferred ACK transmit ─────────────────────────────────────────
-  if (pendingAck && now >= pendingAckTime) {
-    String ack = "ACK:" + pendingAckTarget;
-    LoRa.beginPacket(); LoRa.print(ack); LoRa.endPacket();
-    // Brief yellow flash to show radio TX
-    digitalWrite(LED_YELLOW, HIGH); delay(30); digitalWrite(LED_YELLOW, LOW);
-    Serial.printf("[LoRa] ACK sent: %s\n", ack.c_str());
-    pendingAck = false; pendingAckTarget = "";
+  // ── Periodic neighbour beacon ──────────────────────────────────────
+  if (now - lastHelloAt > HELLO_INTERVAL_MS) {
+    lastHelloAt = now;
+    sendHello();
   }
 
-  // ── Deferred PONG transmit ────────────────────────────────────────
-  if (pendingPong && now >= pendingPongTime) {
-    String pong = String(THIS_DEVICE_ID) + ":" + pendingPongTarget + ":" + DISCOVERY_PONG;
-    LoRa.beginPacket(); LoRa.print(pong); LoRa.endPacket();
-    digitalWrite(LED_YELLOW, HIGH); delay(30); digitalWrite(LED_YELLOW, LOW);
-    Serial.printf("[LoRa] PONG sent to %s\n", pendingPongTarget.c_str());
-    pendingPong = false; pendingPongTarget = "";
-  }
+  // ── Reliability bookkeeping ────────────────────────────────────────
+  pendingAckTick();
+  pendingRouteTick();
 
-  // ── v5: Deferred SOS re-broadcast ────────────────────────────────
+  // ── v5: SOS re-broadcast (raw mesh bytes, same msgId each repeat —
+  //        receivers' dedup cache naturally absorbs the extras once
+  //        they've already processed/forwarded the first copy) ───────
   if (sosRepeatsLeft > 0 && now >= sosRepeatNext) {
-    LoRa.beginPacket(); LoRa.print(sosRepeatPacket); LoRa.endPacket();
-    msgSent++;
-    digitalWrite(LED_YELLOW, HIGH); delay(30); digitalWrite(LED_YELLOW, LOW);
+    enqueueRaw(sosRepeatBuf, sosRepeatLen, PRIO_SOS, true);
     sosRepeatsLeft--;
     sosRepeatNext = now + SOS_REPEAT_GAP_MS + random(120);
-    Serial.printf("[LoRa] SOS resend (%d left)\n", sosRepeatsLeft);
   }
 
-  // ── Periodic stats (every 5 s) ────────────────────────────────────
+  // ── Drain one packet from the priority send queue ──────────────────
+  drainOutQueue();
+
+  // ── Periodic stats (every 5 s) ──────────────────────────────────────
   static unsigned long lastStats = 0;
   if (now - lastStats > 5000 && connectedClients > 0) {
     lastStats = now;
@@ -734,117 +1326,39 @@ void loop() {
     doc["messagesReceived"] = msgReceived;
     doc["uptime"]           = now / 1000;
     doc["connectedClients"] = connectedClients;
+    doc["pktForwarded"]     = pktForwarded;       // additive mesh diagnostics
+    doc["pktDroppedDup"]    = pktDroppedDup;
+    doc["pktDroppedNoRoute"]= pktDroppedNoRoute;
+    doc["routeDiscoveries"] = routeDiscoveries;
     String out; serializeJson(doc, out); wsBroadcast(out);
   }
 
-  // ── LoRa RECEIVE ──────────────────────────────────────────────────
+  // ── LoRa RECEIVE ─────────────────────────────────────────────────────
   int packetSize = LoRa.parsePacket();
   if (packetSize > 0) {
-    String raw = "";
-    raw.reserve(packetSize);
-    while (LoRa.available()) raw += (char)LoRa.read();
+    uint8_t buf[MAX_PACKET_SIZE];
+    int n = 0;
+    while (LoRa.available() && n < MAX_PACKET_SIZE) buf[n++] = (uint8_t)LoRa.read();
     int16_t rssi = LoRa.packetRssi();
-    float   snr  = LoRa.packetSnr();   // v6: SNR for link quality indicator
+    float   snr  = LoRa.packetSnr();
 
-    // Brief yellow flash on RX
-    digitalWrite(LED_YELLOW, HIGH); delay(30); digitalWrite(LED_YELLOW, LOW);
+    digitalWrite(LED_YELLOW, HIGH); delay(20); digitalWrite(LED_YELLOW, LOW);
 
-    Serial.printf("[LoRa] RX %d bytes RSSI %d SNR %.1f: %s\n",
-                  packetSize, rssi, snr, raw.c_str());
-
-    // ── ACK handling ────────────────────────────────────────────────
-    if (raw.startsWith("ACK:")) {
-      String target = raw.substring(4); target.trim();
-      if (target == THIS_DEVICE_ID) {
-        triggerGreenConfirm();   // green blink = message delivered
-        doc.clear(); doc["type"] = "delivery"; doc["status"] = "delivered";
-        String out; serializeJson(doc, out); wsBroadcast(out);
-        Serial.println("[LoRa] ACK received — delivered.");
-      }
-      return;
-    }
-
-    // ── Parse SENDER:RECIPIENT:CONTENT ─────────────────────────────
-    String sender, recipient, content;
-    if (!parseLoraPacket(raw, sender, recipient, content)) return;
-
-    // Drop own echo
-    if (sender == THIS_DEVICE_ID) return;
-
-    // v3: Accept broadcast packets addressed to "*"
-    bool isBroadcast = (recipient == "*");
-    bool forUs       = isBroadcast || (recipient == THIS_DEVICE_ID);
-    if (!forUs) return;
-
-    // ── DISCOVERY PING ──────────────────────────────────────────────
-    if (content == DISCOVERY_PING) {
-      pendingPong = true;
-      pendingPongTarget = sender;
-      pendingPongTime   = now + PONG_DELAY_MIN_MS
-                              + random(PONG_DELAY_MAX_MS - PONG_DELAY_MIN_MS);
-      return;
-    }
-
-    // ── DISCOVERY PONG ──────────────────────────────────────────────
-    if (content == DISCOVERY_PONG) {
-      // A node replied to our scan — end scanning state
-      isScanning = false;
-      if (connectedClients > 0) setLedState(LED_NORMAL);
-      doc.clear(); doc["type"] = "discovery"; doc["deviceId"] = sender;
-      doc["rssi"] = rssi; doc["snr"] = snr;
-      String out; serializeJson(doc, out); wsBroadcast(out);
-      return;
-    }
-
-    // ── Valid message (unicast or broadcast) ────────────────────────
-    msgReceived++; lastMsgTime = now;
-    Serial.printf("[LoRa] MSG %s→%s: %s\n",
-                  sender.c_str(), recipient.c_str(), content.c_str());
-
-    // Forward to app
-    doc.clear();
-    doc["type"]   = "message";
-    doc["sender"] = sender;
-    doc["data"]   = content;
-    doc["rssi"]   = rssi;
-    doc["snr"]    = snr;
-    if (isBroadcast) doc["broadcast"] = true;
-    String out; serializeJson(doc, out);
-    wsBroadcast(out);
-
-    // SOS content → trigger emergency LED
-    if (content.indexOf("SOS") >= 0) {
-      triggerEmergencyBlink();
-    }
-
-    // v3: ACK only for unicast messages (not broadcasts — avoids ACK storm)
-    if (!isBroadcast) {
-      pendingAck       = true;
-      pendingAckTarget = sender;
-      pendingAckTime   = now + ACK_DELAY_MS;
-    }
+    handleReceivedPacket(buf, n, rssi, snr);
   }
 
   // ════════════════════════════════════════════════════════════════════
-  // SOS BUTTON  ← UNTOUCHED FROM v4 (edge detection preserved)
-  //
-  // DO NOT MODIFY this section. The SOS logic is working correctly.
-  // All we do here is call triggerEmergencyBlink() so the LED system
-  // reflects the emergency without changing any SOS behavior.
+  // SOS BUTTON  ← edge detection preserved from earlier firmware
   // ════════════════════════════════════════════════════════════════════
   {
     bool sosNow = digitalRead(BTN_SOS);
     if (sosNow == LOW && lastSosState == HIGH) {
-      String pkt = String(THIS_DEVICE_ID) + ":*:SOS Tafadhali! Naomba msaada wa haraka.";
-      LoRa.beginPacket(); LoRa.print(pkt); LoRa.endPacket();
-      msgSent++;
-      triggerEmergencyBlink();   // ← only addition: LED reflects SOS
-      scheduleSosRepeats(pkt);
+      sendAppMessage(BROADCAST_ID, "SOS Tafadhali! Naomba msaada wa haraka.");
       doc.clear(); doc["type"] = "message"; doc["sender"] = THIS_DEVICE_ID;
       doc["data"] = "SOS Tafadhali! Naomba msaada wa haraka.";
       doc["broadcast"] = true;
       String out; serializeJson(doc, out); wsBroadcast(out);
-      Serial.println("[BTN] SOS sent (single press, +repeats).");
+      Serial.println("[BTN] SOS sent (mesh broadcast, +repeats).");
     }
     lastSosState = sosNow;
   }
