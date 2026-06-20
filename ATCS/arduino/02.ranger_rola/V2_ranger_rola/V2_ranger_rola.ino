@@ -9,11 +9,11 @@
  * ║    1. Find the "DEVICE IDENTITY" section below.                      ║
  * ║    2. Change THIS_DEVICE_ID to a unique name (no spaces/colons).     ║
  * ║       This name IS the node's mesh address — every node on the       ║
- * ║       network must have a different one (e.g. "Node1".."Node4").    ║
+ * ║       network must have a different one (e.g. "Node1".."Node4").     ║
  * ║    3. Change WIFI_SSID to match — e.g. "Fling_Node2"                 ║
  * ║    4. Flash to the ESP32.  Repeat for each node with a new ID.       ║
  * ║                                                                      ║
- * ║  The app connects to:  ws://192.168.4.1:8765                        ║
+ * ║  The app connects to:  ws://192.168.4.1:8765                         ║
  * ║  WiFi password is always:  fling1234                                 ║
  * ╚══════════════════════════════════════════════════════════════════════╝
  *
@@ -144,9 +144,9 @@
 // be different on every physical node and MUST be 8 characters or
 // fewer (NODE_ID_LEN below) so it fits the fixed-size header field.
 // ════════════════════════════════════════════════════════════════════════
-#define THIS_DEVICE_ID  "Node1"          // ← Change per node (max 8 chars)
-#define WIFI_SSID       "Fling_Node1"    // ← Must match THIS_DEVICE_ID suffix
-#define WIFI_PASS       "fling1234"
+#define THIS_DEVICE_ID  "Node4"          // ← Change per node (max 8 chars)
+#define WIFI_SSID       "ATCS_Node4"    // ← Must match THIS_DEVICE_ID suffix
+#define WIFI_PASS       "atcs123"
 
 // ════════════════════════════════════════════════════════════════════════
 // LoRa SETTINGS — all nodes must use the same values
@@ -252,6 +252,42 @@ struct MeshHeader {
   uint8_t  payloadLen;
 };
 
+// ── NOTE ON TYPE ORDERING (Arduino-specific gotcha) ─────────────────────
+// The Arduino IDE auto-generates forward declarations ("prototypes") for
+// every function in this file and inserts them all in one block, right
+// before the very FIRST function below (writeId). If a function uses a
+// struct/enum type that is defined further down in the file, that
+// auto-generated prototype fails to compile because the type doesn't
+// exist yet at that point — even though it "looks" fine reading top to
+// bottom. The fix is simply to make sure every struct/enum that is ever
+// used as a function PARAMETER or RETURN TYPE is defined up here, before
+// any function. (Struct/enum types only used for plain variables, like
+// BtnMachineState below, don't have this problem — only function
+// signatures get hoisted.) That's why LedState and RouteEntry are
+// defined here instead of next to the rest of the LED/route code further
+// down — setLedState(LedState) and findRoute()->RouteEntry* need them
+// available at the hoisting point.
+
+enum LedState {
+  LED_NORMAL,     // Green solid — connected and ready
+  LED_SCANNING,   // Yellow slow blink — discovering nodes
+  LED_WARNING,    // Yellow fast blink — no app connected / reconnecting
+  LED_EMERGENCY,  // Red fast blink — SOS sent or received
+  LED_CRITICAL    // Red solid — hardware failure (LoRa init failed)
+};
+
+// Route table: "to reach <dest>, send to <nextHop>". Built reactively by
+// RREQ/RREP (and by DISCOVER, which doubles as a free route discovery
+// for whoever sent it). Declared here (not next to the other mesh
+// tables below) because findRoute() returns RouteEntry* — see note above.
+struct RouteEntry {
+  bool          valid;
+  char          dest[NODE_ID_LEN + 1];
+  char          nextHop[NODE_ID_LEN + 1];
+  uint8_t       hopCount;
+  unsigned long lastUsed;
+};
+
 // Write a NodeID string into a fixed NODE_ID_LEN field, zero-padded.
 static void writeId(uint8_t* buf, int offset, const char* id) {
   memset(buf + offset, 0, NODE_ID_LEN);
@@ -316,14 +352,8 @@ NeighborEntry neighbors[MAX_NEIGHBORS];
 
 // ── Route table: "to reach <dest>, send to <nextHop>". Built reactively
 //    by RREQ/RREP (and by DISCOVER, which doubles as a free route
-//    discovery for whoever sent it). ──────────────────────────────────
-struct RouteEntry {
-  bool          valid;
-  char          dest[NODE_ID_LEN + 1];
-  char          nextHop[NODE_ID_LEN + 1];
-  uint8_t       hopCount;
-  unsigned long lastUsed;
-};
+//    discovery for whoever sent it). RouteEntry itself is defined up at
+//    the top of the file (see the type-ordering note there). ──────────
 RouteEntry routes[MAX_ROUTES];
 
 // ── Seen cache: de-duplication. Every packet is identified by
@@ -382,15 +412,8 @@ uint16_t nextMsgId = 1;   // incremented for every packet WE originate
 
 // ════════════════════════════════════════════════════════════════════════
 // LED STATE MACHINE  (unchanged behaviour from v7)
+// LedState itself is defined up at the top of the file (type-ordering note).
 // ════════════════════════════════════════════════════════════════════════
-
-enum LedState {
-  LED_NORMAL,     // Green solid — connected and ready
-  LED_SCANNING,   // Yellow slow blink — discovering nodes
-  LED_WARNING,    // Yellow fast blink — no app connected / reconnecting
-  LED_EMERGENCY,  // Red fast blink — SOS sent or received
-  LED_CRITICAL    // Red solid — hardware failure (LoRa init failed)
-};
 
 LedState currentLedState   = LED_NORMAL;
 LedState requestedLedState = LED_NORMAL;
@@ -709,7 +732,7 @@ void drainOutQueue() {
 // WEBSOCKET BROADCAST  (to the one phone connected to this node)
 // ════════════════════════════════════════════════════════════════════════
 
-void wsBroadcast(const String& json) {
+void wsBroadcast(String& json) {
   if (connectedClients > 0) webSocket.broadcastTXT(json);
 }
 
