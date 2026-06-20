@@ -144,9 +144,9 @@
 // be different on every physical node and MUST be 8 characters or
 // fewer (NODE_ID_LEN below) so it fits the fixed-size header field.
 // ════════════════════════════════════════════════════════════════════════
-#define THIS_DEVICE_ID  "Node4"          // ← Change per node (max 8 chars)
-#define WIFI_SSID       "ATCS_Node4"    // ← Must match THIS_DEVICE_ID suffix
-#define WIFI_PASS       "atcs123"
+#define THIS_DEVICE_ID  "Node3"          // ← Change per node (max 8 chars)
+#define WIFI_SSID       "ATCS_Node3"    // ← Must match THIS_DEVICE_ID suffix
+#define WIFI_PASS       "atcs1234"
 
 // ════════════════════════════════════════════════════════════════════════
 // LoRa SETTINGS — all nodes must use the same values
@@ -432,16 +432,18 @@ unsigned long yellowBlinkNext = 0;
 
 void setLedState(LedState s) { requestedLedState = s; }
 
+// 2 blinks (4 on/off transitions) — message delivered.
 void triggerGreenConfirm() {
-  greenBlinkCount = 6;
+  greenBlinkCount = 4;
   greenBlinkOn    = false;
   greenBlinkNext  = millis();
 }
 
+// 3 blinks (6 on/off transitions) — emergency/SOS activity.
 void triggerEmergencyBlink() {
   stateAfterEmerg = requestedLedState;
   setLedState(LED_EMERGENCY);
-  redBlinkCount = 10;
+  redBlinkCount = 6;
   redBlinkOn    = true;
   redBlinkNext  = millis();
   digitalWrite(LED_RED, HIGH);
