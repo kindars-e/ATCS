@@ -4,6 +4,13 @@ import {
   ChevronDown, ChevronUp, Terminal, Smartphone, Monitor, Cpu,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+// [STEP 2 — RUNTIME STABILITY] Real OS-level network state, replacing the
+// previous approach of inferring connectivity purely from whether a raw
+// WebSocket connect attempt timed out. Knowing there's no Wi-Fi link at all
+// lets us skip the multi-second WS timeout entirely and show the correct
+// status immediately; it also lets us auto-retry the moment Wi-Fi changes
+// instead of requiring a manual "Retry" tap.
+import { Network } from '@capacitor/network';
 
 interface WiFiConnectionModalProps {
   onConnected: () => void;
@@ -57,6 +64,29 @@ export default function WiFiConnectionModal({ onConnected }: WiFiConnectionModal
     setIsChecking(true);
     setDebugInfo('Checking connection to Ranger…');
 
+    // [STEP 2 — FIX] Ask the OS first, but only to rule out "no radio link at
+    // all" (Wi-Fi off / airplane mode). We deliberately do NOT use Capacitor's
+    // `connected` boolean here: on Android it requires NET_CAPABILITY_VALIDATED
+    // (i.e. the OS confirmed real internet access) — and the Ranger node's
+    // hotspot has NO internet by design, so `connected` would always be false
+    // even when correctly joined to the node, permanently short-circuiting this
+    // check before the WebSocket was ever tried. `connectionType` reflects the
+    // actual radio transport (wifi/cellular/none) regardless of internet
+    // validation, so checking for `'none'` is the correct "is there any radio
+    // link at all" signal without assuming internet exists.
+    try {
+      const netStatus = await Network.getStatus();
+      if (netStatus.connectionType === 'none') {
+        setConnectionStatus('not-connected');
+        setDebugInfo('Wi-Fi is off — turn it on and join the Ranger network first.');
+        setIsChecking(false);
+        return;
+      }
+    } catch {
+      // Network plugin unavailable (e.g. very old platform) — fall through
+      // to the WebSocket-based check exactly as before.
+    }
+
     try {
       if (window.Capacitor) {
         const ws = new WebSocket('ws://192.168.4.1:8765');
@@ -95,6 +125,26 @@ export default function WiFiConnectionModal({ onConnected }: WiFiConnectionModal
   }, [onConnected]);
 
   useEffect(() => { checkConnection(); }, [checkConnection]);
+
+  // [STEP 2] If the OS-reported network state changes while this screen is
+  // showing (user joins/leaves Wi-Fi without leaving the app), re-run the
+  // check automatically instead of requiring a manual "Retry" tap.
+  useEffect(() => {
+    let removeListener: (() => void) | undefined;
+    let cancelled = false;
+
+    Network.addListener('networkStatusChange', () => {
+      checkConnection();
+    }).then((handle) => {
+      if (cancelled) handle.remove();
+      else removeListener = () => handle.remove();
+    });
+
+    return () => {
+      cancelled = true;
+      removeListener?.();
+    };
+  }, [checkConnection]);
 
   return (
     <div className="fixed inset-0 z-50 flex flex-col items-center justify-start bg-gray-900 overflow-y-auto">

@@ -14,9 +14,31 @@
 // [NEW] Additional events emitted:
 //   pair-request  – another node wants to pair with us
 //   pair-accepted – the node we sent a pair request to has accepted
+//
+// [STEP 2 — RUNTIME STABILITY] Android lifecycle + network awareness.
+//   A WebSocket that reads readyState===OPEN is not proof the link is alive:
+//   Android can freeze this app's JS timers while it's backgrounded (screen
+//   locked / another app in front), and/or the OS can drop Wi-Fi entirely,
+//   without ever firing a clean `onclose`. Two Capacitor plugins close that
+//   gap:
+//     @capacitor/app     – tells us when the app resumes/pauses. On resume we
+//                          don't wait for the next scheduled heartbeat tick
+//                          (which may have been frozen) — we verify the
+//                          connection immediately. On pause we stop the
+//                          heartbeat timer so we're not burning battery
+//                          pinging a socket Android is about to suspend.
+//     @capacitor/network – tells us the REAL OS-level Wi-Fi state, instead of
+//                          inferring connectivity purely from a WebSocket
+//                          connect/timeout. A network loss flips the UI state
+//                          immediately rather than waiting for the socket to
+//                          eventually time out.
+//   Both plugins ship a web-platform fallback (visibility/online events), so
+//   this still works unchanged in a plain browser during `npm run dev`.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { App, type AppState } from "@capacitor/app";
+import { Network, type ConnectionStatus } from "@capacitor/network";
 import {
   CONNECT_TIMEOUT_MS,
   MAX_RECONNECT_ATTEMPTS,
@@ -88,8 +110,36 @@ export function useRangerConnection({
   const enabledRef          = useRef(enabled);
   const onEventRef          = useRef(onEvent);
 
+  // [STEP 2] Tracks whether the OS currently reports a real network/Wi-Fi
+  // link, independent of our own WebSocket's belief about its state.
+  const networkConnectedRef = useRef(true);
+
   useEffect(() => { enabledRef.current = enabled; }, [enabled]);
   useEffect(() => { onEventRef.current = onEvent;  }, [onEvent]);
+
+  // [STEP 2] Heartbeat start/stop pulled out of connect()'s onopen handler so
+  // the app-lifecycle listener can stop it on background and restart it on
+  // resume, without tearing down and reopening the WebSocket itself.
+  const startHeartbeat = useCallback(() => {
+    if (pingTimerRef.current) clearInterval(pingTimerRef.current);
+    pingTimerRef.current = setInterval(() => {
+      const socket = wsRef.current;
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+
+      if (Date.now() - lastPongRef.current > PONG_TIMEOUT_MS) {
+        try { socket.close(); } catch { /* ignore */ }
+        return;
+      }
+      try { socket.send(JSON.stringify({ type: "ping" })); } catch { /* ignore */ }
+    }, PING_INTERVAL_MS);
+  }, []);
+
+  const stopHeartbeat = useCallback(() => {
+    if (pingTimerRef.current) {
+      clearInterval(pingTimerRef.current);
+      pingTimerRef.current = null;
+    }
+  }, []);
 
   const connect = useCallback(() => {
     if (!enabledRef.current) return;
@@ -142,21 +192,7 @@ export function useRangerConnection({
       // with "pong", and normal traffic counts too). If the link has gone
       // silent past the timeout, we treat the socket as dead and force a
       // reconnect rather than waiting forever.
-      if (pingTimerRef.current) clearInterval(pingTimerRef.current);
-      pingTimerRef.current = setInterval(() => {
-        const socket = wsRef.current;
-        if (!socket || socket.readyState !== WebSocket.OPEN) return;
-
-        // Has the firmware gone silent for too long?
-        if (Date.now() - lastPongRef.current > PONG_TIMEOUT_MS) {
-          // Dead link. Close it; ws.onclose will schedule a reconnect.
-          try { socket.close(); } catch { /* ignore */ }
-          return;
-        }
-
-        // Otherwise send a fresh ping to keep proving liveness.
-        try { socket.send(JSON.stringify({ type: "ping" })); } catch { /* ignore */ }
-      }, PING_INTERVAL_MS);
+      startHeartbeat();
     };
 
     ws.onclose = () => {
@@ -166,10 +202,7 @@ export function useRangerConnection({
       wsRef.current = null;
 
       // [v5] Stop the heartbeat — a new one starts when we reconnect (onopen).
-      if (pingTimerRef.current) {
-        clearInterval(pingTimerRef.current);
-        pingTimerRef.current = null;
-      }
+      stopHeartbeat();
       if (healthCheckRef.current) {
         clearInterval(healthCheckRef.current);
         healthCheckRef.current = null;
@@ -318,7 +351,7 @@ export function useRangerConnection({
           break;
       }
     };
-  }, []);
+  }, [startHeartbeat, stopHeartbeat]);
 
   useEffect(() => {
     if (enabled) connect();
@@ -366,6 +399,110 @@ export function useRangerConnection({
     }
     connect();
   }, [connect]);
+
+  // [STEP 2] Called on app resume (and after a network-returns event) to
+  // confirm the connection is REALLY alive right now, instead of trusting
+  // whatever state we were last in before a possible Android-induced freeze.
+  //   - No socket / not OPEN            → reconnect immediately.
+  //   - OPEN but heartbeat reply is old → treat as dead, reconnect.
+  //   - OPEN and recently heard from    → send an immediate ping to refresh
+  //                                       the liveness clock right now rather
+  //                                       than waiting for the next tick.
+  const verifyConnectionNow = useCallback(() => {
+    if (!enabledRef.current) return;
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      reconnect();
+      return;
+    }
+    if (Date.now() - lastPongRef.current > PONG_TIMEOUT_MS) {
+      reconnect();
+      return;
+    }
+    try {
+      ws.send(JSON.stringify({ type: "ping" }));
+    } catch {
+      reconnect();
+    }
+  }, [reconnect]);
+
+  // [STEP 2] Android lifecycle: on resume, verify the connection right away
+  // (don't wait for a possibly-frozen heartbeat tick); on pause, stop the
+  // heartbeat so we're not pinging a socket the OS may be about to suspend.
+  // @capacitor/app has a web fallback (visibility/focus events), so this is
+  // a no-op-safe addition in a plain browser during `npm run dev`.
+  useEffect(() => {
+    let removeListener: (() => void) | undefined;
+    let cancelled = false;
+
+    App.addListener("appStateChange", (state: AppState) => {
+      if (state.isActive) {
+        if (enabledRef.current) {
+          startHeartbeat();
+          verifyConnectionNow();
+        }
+      } else {
+        stopHeartbeat();
+      }
+    }).then((handle) => {
+      if (cancelled) handle.remove();
+      else removeListener = () => handle.remove();
+    });
+
+    return () => {
+      cancelled = true;
+      removeListener?.();
+    };
+  }, [startHeartbeat, stopHeartbeat, verifyConnectionNow]);
+
+  // [STEP 2] Real OS-level network awareness: a network loss flips the UI
+  // state immediately (instead of waiting for the WebSocket to eventually
+  // time out), and a network's return triggers an immediate reconnect
+  // attempt instead of waiting on the backoff schedule.
+  useEffect(() => {
+    let removeListener: (() => void) | undefined;
+    let cancelled = false;
+
+    // [FIX] Deliberately NOT using ConnectionStatus.connected here: on Android
+    // that requires NET_CAPABILITY_VALIDATED, meaning the OS confirmed real
+    // internet access. The Ranger node's hotspot has no internet by design,
+    // so `connected` would always read false while correctly joined to it —
+    // which would force this hook into a permanent false "disconnected" state
+    // the instant the OS re-evaluates network capabilities. `connectionType`
+    // reflects the actual radio transport (wifi/cellular/none) regardless of
+    // internet validation, so "none" is the correct "network is really gone"
+    // signal for an intentionally-offline local network like this one.
+    const hasLink = (status: ConnectionStatus) => status.connectionType !== "none";
+
+    Network.getStatus().then((status) => {
+      networkConnectedRef.current = hasLink(status);
+    });
+
+    Network.addListener("networkStatusChange", (status: ConnectionStatus) => {
+      const wasConnected = networkConnectedRef.current;
+      const isConnected  = hasLink(status);
+      networkConnectedRef.current = isConnected;
+
+      if (!isConnected) {
+        // Real signal the network is gone — don't wait for the socket to
+        // notice on its own; reflect it in the UI right now.
+        setConnectionState("disconnected");
+        setIsOnline(false);
+      } else if (!wasConnected && enabledRef.current) {
+        // Network just came back — try right away rather than waiting on
+        // whatever backoff delay we were mid-way through.
+        reconnect();
+      }
+    }).then((handle) => {
+      if (cancelled) handle.remove();
+      else removeListener = () => handle.remove();
+    });
+
+    return () => {
+      cancelled = true;
+      removeListener?.();
+    };
+  }, [reconnect]);
 
   return {
     connectionState,

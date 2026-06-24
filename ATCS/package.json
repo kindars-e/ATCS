@@ -16,11 +16,13 @@
     "capacitor:sync": "npx cap sync"
   },
   "dependencies": {
+    "@capacitor/android": "^7.6.7",
     "@capacitor/app": "^7.0.1",
     "@capacitor/cli": "^7.4.2",
     "@capacitor/core": "^7.4.2",
     "@capacitor/ios": "^7.4.2",
     "@capacitor/keyboard": "^7.0.1",
+    "@capacitor/network": "^7.0.4",
     "@exxili/capacitor-nfc": "^0.0.11",
     "@radix-ui/react-avatar": "^1.1.6",
     "@radix-ui/react-scroll-area": "^1.2.5",

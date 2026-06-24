@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">ATCS</string>
+    <string name="title_activity_main">ATCS</string>
+    <string name="package_name">com.fling.app</string>
+    <string name="custom_url_scheme">com.fling.app</string>
+</resources>
