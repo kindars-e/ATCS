@@ -35,24 +35,25 @@ export const RECONNECT_MAX_DELAY_MS   = 5_000;
 export const PING_INTERVAL_MS = 5_000;
 export const PONG_TIMEOUT_MS  = 8_000;
 
-// ── [v6 RANGE DETECTION] Per-node signal quality + reachability ───────────────
-// These classify each remote node's link into a status the user can read at a
-// glance, using the RSSI the firmware reports and how long since we last heard.
-//
+// ── [STEP 4A] Signal quality — RSSI-only, never time-based ────────────────────
 // RSSI (Received Signal Strength Indicator) is in dBm and is always NEGATIVE;
 // closer to 0 = stronger. Typical LoRa: -40 (very close) … -120 (far/edge).
-//   stronger than RSSI_WEAK_DBM     → "online"  (good signal)
-//   between WEAK and MIN            → "weak"    (works, but fragile)
-//   weaker than RSSI_MIN_DBM        → effectively unusable
-export const RSSI_WEAK_DBM = -100;   // below this (e.g. -105) = weak signal
-export const RSSI_MIN_DBM  = -120;   // below this = basically out of range
+//   stronger than RSSI_STRONG_DBM        → "strong"
+//   between STRONG and WEAK              → "good"
+//   weaker than RSSI_WEAK_DBM            → "weak" (fragile but still a link)
+//   no reading at all                    → "unknown" (never fabricated)
+export const RSSI_STRONG_DBM = -85;  // at/above this = strong signal
+export const RSSI_WEAK_DBM   = -100; // below this = weak signal
 
-// Reachability is time-based: silence is the strongest sign a node left range.
-//   quiet longer than NODE_STALE_MS   → degrade to "weak"
-//   quiet longer than NODE_OFFLINE_MS → "out of range"
-// Any received packet (message/discovery/location) resets a node's clock.
-export const NODE_STALE_MS   = 30_000;   // 30 s quiet → "weak"
-export const NODE_OFFLINE_MS = 90_000;   // 90 s quiet → "out of range"
+// A signal reading older than this is shown as stale (muted + age label)
+// rather than presented as if it were current.
+export const SIGNAL_SAMPLE_STALE_MS = 60_000; // 60 s
+
+// ── [STEP 4A] Reachability — time-only, never influenced by signal strength ──
+// Silence is the strongest sign a node left range. Any received packet
+// (message/discovery/location/relayed HELLO) resets a node's clock.
+export const NODE_STALE_MS   = 30_000;   // 30 s quiet → "stale"
+export const NODE_OFFLINE_MS = 90_000;   // 90 s quiet → "offline"
 
 // How often the app re-evaluates every node's status (ms). A steady tick is
 // what makes statuses update dynamically without the user doing anything.

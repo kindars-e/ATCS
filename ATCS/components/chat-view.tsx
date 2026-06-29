@@ -379,10 +379,9 @@ export function ChatView({
                         {contact.frequency ? `${contact.frequency / 1000000} MHz` : ""}
                       </span>
                       <span>•</span>
-                      {/* [v6] For a real node, show its LoRa range status (online /
-                          weak / out of range) from the range monitor. The Emergency
-                          channel has no single remote node, so it falls back to the
-                          local Wi-Fi link status (isOnline). */}
+                      {/* [STEP 4A] Reachability + signal quality shown independently
+                          for a real node. The Emergency channel has no single remote
+                          node, so it falls back to the local Wi-Fi link status (isOnline). */}
                       {isEmergency ? (
                         isOnline ? (
                           <span className="text-emerald-400 font-medium">Online</span>
@@ -392,8 +391,11 @@ export function ChatView({
                       ) : (
                         <SignalIndicator
                           variant="full"
-                          status={contact.status}
+                          reachability={contact.reachability}
+                          signalQuality={contact.signalQuality}
                           rssi={contact.rssi}
+                          signalSampledAt={contact.signalSampledAt}
+                          signalHopDistance={contact.signalHopDistance}
                         />
                       )}
                     </p>

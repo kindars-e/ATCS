@@ -21,6 +21,9 @@
 //   stats       – periodic health counters (ignored by app)
 //   delivery    – ACK: remote node confirmed it received our message
 //   discovery   – a nearby node replied to our discovery ping
+//   neighbor    – [STEP 4A] relayed RSSI/SNR from a direct neighbor's HELLO
+//                 beacon. Reuses traffic that was already happening every
+//                 HELLO_INTERVAL_MS — no new LoRa packets are sent for this.
 //
 // LoRa DATA SENTINELS (embedded in message.data field):
 //   ##LOCATION_REQUEST##                  – requester asks for responder's GPS
@@ -55,7 +58,8 @@ export type IncomingFrame =
                            spreadingFactor?: number; bandwidth?: number }
   | { type: "stats";       [key: string]: unknown }
   | { type: "delivery";    status: "delivered" }
-  | { type: "discovery";   deviceId: string; rssi?: number };
+  | { type: "discovery";   deviceId: string; rssi?: number }
+  | { type: "neighbor";    deviceId: string; rssi?: number; snr?: number };
 
 // ── Decoded message types ─────────────────────────────────────────────────────
 export type DecodedMessage =

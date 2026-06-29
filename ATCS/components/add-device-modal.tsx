@@ -67,7 +67,9 @@ function makeContact(deviceId: string, deviceName: string): Contact {
     spreadingFactor: RADIO_SPREADING_FACTOR,
     bandwidth:       RADIO_BANDWIDTH_HZ,
     unreadCount:     0,
-    status:          "offline",
+    // [STEP 4A] lastSeen is "now" (we just paired), so reachability should
+    // reflect that — not the old hardcoded "offline" placeholder.
+    reachability:    "online",
     lastSeen:        new Date(),
   };
 }

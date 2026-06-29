@@ -48,7 +48,7 @@ import {
   RADIO_FREQUENCY_HZ,
   RADIO_SPREADING_FACTOR,
   RANGE_CHECK_INTERVAL_MS,
-  RSSI_MIN_DBM,
+  RSSI_STRONG_DBM,
   RSSI_WEAK_DBM,
   SPLASH_DURATION_MS,
 } from "@/lib/constants";
@@ -66,7 +66,8 @@ import type {
   Contact,
   ContactLocation,
   Message,
-  RangeStatus,
+  ReachabilityStatus,
+  SignalQuality,
   View,
   Waypoint,
 } from "@/lib/types";
@@ -90,22 +91,31 @@ const EMERGENCY_CONTACT: Contact = {
   spreadingFactor: RADIO_SPREADING_FACTOR,
   bandwidth:       RADIO_BANDWIDTH_HZ,
   unreadCount:     0,
-  status:          "online",
+  reachability:    "online",
 };
 
-// ── [v6 RANGE DETECTION] Pure status classifier ──────────────────────────────
-// Decide a node's link status from how long since we last heard it (ageMs) and
-// the last RSSI we saw. Pure function (no React, no side effects) so it's easy
-// to test and reuse. Time-based reachability wins first — silence is the
-// strongest evidence a node has left range — then signal strength refines it.
-function classifyStatus(ageMs: number, rssi?: number): RangeStatus {
-  if (ageMs > NODE_OFFLINE_MS) return "out-of-range";
-  if (ageMs > NODE_STALE_MS)   return "weak";
-  if (rssi !== undefined) {
-    if (rssi < RSSI_MIN_DBM)  return "out-of-range"; // essentially unusable
-    if (rssi < RSSI_WEAK_DBM) return "weak";         // fragile but working
-  }
+// ── [STEP 4A] Pure classifiers — reachability and signal quality are fully
+// independent. Neither one is allowed to see the other's input. ─────────────
+//
+// Reachability: ONLY lastSeen/elapsed time. Signal strength must never
+// influence this — a node heard 0.5s ago is "online" even with a terrible
+// reading; a node not heard from in 2 minutes is "offline" even with a
+// perfect last-known reading.
+function classifyReachability(ageMs: number): ReachabilityStatus {
+  if (ageMs > NODE_OFFLINE_MS) return "offline";
+  if (ageMs > NODE_STALE_MS)   return "stale";
   return "online";
+}
+
+// Signal quality: ONLY the RSSI value itself. Time since last contact must
+// never influence this — it's purely "how good was the link, last time we
+// actually measured it." Callers are responsible for separately surfacing
+// how OLD that measurement is (see signalSampledAt / SIGNAL_SAMPLE_STALE_MS).
+function classifySignalQuality(rssi?: number): SignalQuality {
+  if (rssi === undefined) return "unknown"; // never fabricate a value
+  if (rssi >= RSSI_STRONG_DBM) return "strong";
+  if (rssi >= RSSI_WEAK_DBM)   return "good";
+  return "weak";
 }
 
 export default function FlingApp() {
@@ -161,9 +171,11 @@ export default function FlingApp() {
   // handler can resolve sender names without being re-created on every contact
   // change. Updated by the effect below whenever `contacts` changes.
   const contactsRef = useRef<Contact[]>(contacts);
-  // [v6] Remembers each node's previous status across monitor ticks so we only
-  // notify on a real transition (online → out-of-range), not every tick.
-  const prevStatusRef = useRef<Record<string, RangeStatus>>({});
+  // [STEP 4A] Remembers each node's previous REACHABILITY across monitor
+  // ticks so we only notify on a real transition (online → offline), not
+  // every tick. Signal quality has no time-based decay, so it never needs
+  // this kind of transition tracking.
+  const prevStatusRef = useRef<Record<string, ReachabilityStatus>>({});
   const keyboardHeight   = useMobileKeyboard();
   const activeTrailCount = useActiveTrailCount();
   const pwaInstall       = usePwaInstall();
@@ -195,21 +207,22 @@ export default function FlingApp() {
         prev.map((c) => {
           if (c.deviceId === EMERGENCY_BROADCAST_ID) return c; // pseudo-node
           const ageMs = c.lastSeen ? now - c.lastSeen.getTime() : Infinity;
-          const next  = classifyStatus(ageMs, c.rssi);
+          // [STEP 4A] Reachability ONLY — signal strength never enters here.
+          const next  = classifyReachability(ageMs);
 
           const before = prevStatusRef.current[c.deviceId];
           if (before && before !== next) {
-            if (next === "out-of-range") {
+            if (next === "offline") {
               setRangeNotice(`${c.deviceName} is out of range`);
-            } else if (next === "weak") {
-              setRangeNotice(`${c.deviceName} has a weak signal`);
-            } else if (next === "online" && (before === "out-of-range" || before === "weak")) {
+            } else if (next === "stale") {
+              setRangeNotice(`${c.deviceName} hasn't been heard from recently`);
+            } else if (next === "online" && (before === "offline" || before === "stale")) {
               setRangeNotice(`${c.deviceName} is back online`);
             }
           }
           prevStatusRef.current[c.deviceId] = next;
 
-          return c.status === next ? c : { ...c, status: next };
+          return c.reachability === next ? c : { ...c, reachability: next };
         }),
       );
     };
@@ -307,7 +320,7 @@ export default function FlingApp() {
         // Update name / status if they changed.
         return prev.map((c) =>
           c.deviceId === newContact.deviceId
-            ? { ...c, deviceName: newContact.deviceName, status: "online" as const, lastSeen: new Date() }
+            ? { ...c, deviceName: newContact.deviceName, reachability: "online" as const, lastSeen: new Date() }
             : c
         );
       }
@@ -317,24 +330,34 @@ export default function FlingApp() {
 
   // ════════════════════════════════════════════════════════════════════════
   // [v6 RANGE DETECTION] Record that we just heard from a node.
-  // Updates its signal readings (rssi/snr), lastSeen, and freshly-classified
-  // status in one immutable update. Called from every event that proves a node
-  // is reachable (text, discovery, location). No-op for the "*" pseudo-node.
+  // [STEP 4A] Updates two INDEPENDENT things, each only when proven:
+  //   - reachability: ALWAYS set to "online" — any call here means we just
+  //     proved this node is reachable (text, discovery, location, or a
+  //     relayed HELLO), regardless of whether this particular frame carried
+  //     a signal reading.
+  //   - signal quality (rssi/snr/signalSampledAt/signalHopDistance): ONLY
+  //     touched when THIS event actually carried a fresh rssi reading.
+  //     Otherwise the previous reading (and its age) is left exactly as-is
+  //     — we never fabricate or silently "refresh" a signal value just
+  //     because the node proved reachable some other way.
   // ════════════════════════════════════════════════════════════════════════
   const recordNodeHeard = useCallback(
-    (deviceId: string, rssi?: number, snr?: number) => {
+    (deviceId: string, rssi?: number, snr?: number, hopDistance?: number) => {
       if (!deviceId || deviceId === EMERGENCY_BROADCAST_ID) return;
       const now = new Date();
+      const hasSample = rssi !== undefined;
       setContacts((prev) =>
         prev.map((c) =>
           c.deviceId === deviceId
             ? {
                 ...c,
-                lastSeen: now,
-                // Keep the previous reading if this frame didn't carry one.
-                rssi:   rssi ?? c.rssi,
-                snr:    snr  ?? c.snr,
-                status: classifyStatus(0, rssi ?? c.rssi), // age 0 = just heard
+                lastSeen:     now,
+                reachability: "online",
+                rssi:               hasSample ? rssi          : c.rssi,
+                snr:                hasSample ? (snr ?? c.snr) : c.snr,
+                signalSampledAt:    hasSample ? now            : c.signalSampledAt,
+                signalHopDistance:  hasSample ? hopDistance    : c.signalHopDistance,
+                signalQuality:      hasSample ? classifySignalQuality(rssi) : c.signalQuality,
               }
             : c,
         ),
@@ -450,7 +473,7 @@ export default function FlingApp() {
               spreadingFactor: RADIO_SPREADING_FACTOR,
               bandwidth:       RADIO_BANDWIDTH_HZ,
               unreadCount:     0,
-              status:          "online",
+              reachability:    "online",
               lastSeen:        new Date(),
             });
           }
@@ -473,7 +496,7 @@ export default function FlingApp() {
                         ...c,
                         unreadCount: c.unreadCount + 1,
                         lastSeen: new Date(),
-                        status: "online" as const,
+                        reachability: "online" as const,
                       }
                     : c,
                 ),
@@ -569,10 +592,19 @@ export default function FlingApp() {
           if (prev.some((n) => n.deviceId === event.deviceId)) return prev;
           return [...prev, { deviceId: event.deviceId, rssi: event.rssi }];
         });
-        // [v6] If this node is already a saved contact, a discovery PONG also
-        // proves it's reachable — refresh its signal/status so it flips back to
-        // "online" on a scan.
-        recordNodeHeard(event.deviceId, event.rssi, event.snr);
+        // [v6] If this node is already a saved contact, a discovery reply also
+        // proves it's reachable — refresh its reachability + signal reading.
+        // hops tags the reading as direct (0) vs relayed (>0).
+        recordNodeHeard(event.deviceId, event.rssi, event.snr, event.hops);
+        return;
+      }
+
+      // [STEP 4A] Relayed HELLO reading for a DIRECT neighbor — no new LoRa
+      // traffic was sent for this; the firmware just forwarded a reading it
+      // already had from its existing HELLO_INTERVAL_MS beacon. hopDistance
+      // is always 0 here since HELLO is direct-neighbor-only (TTL=1).
+      case "neighbor-heard": {
+        recordNodeHeard(event.deviceId, event.rssi, event.snr, 0);
         return;
       }
 
@@ -596,7 +628,7 @@ export default function FlingApp() {
           spreadingFactor: RADIO_SPREADING_FACTOR,
           bandwidth:       RADIO_BANDWIDTH_HZ,
           unreadCount:     0,
-          status:          "online",
+          reachability:    "online",
           lastSeen:        new Date(),
         };
         upsertContact(newContact);
@@ -619,7 +651,7 @@ export default function FlingApp() {
           spreadingFactor: RADIO_SPREADING_FACTOR,
           bandwidth:       RADIO_BANDWIDTH_HZ,
           unreadCount:     0,
-          status:          "online",
+          reachability:    "online",
           lastSeen:        new Date(),
         };
         upsertContact(newContact);
@@ -898,7 +930,7 @@ export default function FlingApp() {
       spreadingFactor: RADIO_SPREADING_FACTOR,
       bandwidth:       RADIO_BANDWIDTH_HZ,
       unreadCount:     0,
-      status:          "offline",
+      reachability:    "offline",
       location:        { ...waypoint.location, timestamp: new Date() },
     });
     setShowCompass(true);

@@ -144,8 +144,8 @@
 // be different on every physical node and MUST be 8 characters or
 // fewer (NODE_ID_LEN below) so it fits the fixed-size header field.
 // ════════════════════════════════════════════════════════════════════════
-#define THIS_DEVICE_ID  "Node3"          // ← Change per node (max 8 chars)
-#define WIFI_SSID       "ATCS_Node3"    // ← Must match THIS_DEVICE_ID suffix
+#define THIS_DEVICE_ID  "Node1"          // ← Change per node (max 8 chars)
+#define WIFI_SSID       "ATCS_Node1"    // ← Must match THIS_DEVICE_ID suffix
 #define WIFI_PASS       "atcs1234"
 
 // ════════════════════════════════════════════════════════════════════════
@@ -196,6 +196,14 @@
 #define ACK_TIMEOUT_MS           1500   // how long to wait for an end-to-end ACK
 #define MAX_SEND_RETRIES            3     // unicast resend attempts before giving up
 #define SEEN_CACHE_EXPIRY_MS    30000   // forget old dedup entries
+
+// [STEP 4A FIX #2] Auto-clear scanning mode. The app's continuous scan
+// re-pings every DISCOVERY_SCAN_DURATION_MS + DISCOVERY_REPOLL_DELAY_MS
+// (5000 + 1000 = 6000ms — see lib/constants.ts). This window must be longer
+// than that so an active scan never flickers off between pings; it must
+// still be short enough that isScanning doesn't stay stuck on indefinitely
+// once pings actually stop (modal closed, or a single button-press scan).
+#define DISCOVER_SCAN_WINDOW_MS  7000
 
 #define JITTER_UNICAST_MIN_MS      10
 #define JITTER_UNICAST_MAX_MS      60
@@ -393,6 +401,11 @@ struct PendingAckItem {
   uint8_t       len;
   uint8_t       retriesLeft;
   unsigned long nextRetryAt;
+  // [STEP 4A FIX #3] True if this send is already a post-rediscovery retry
+  // (i.e. its original route already failed once and was rediscovered).
+  // Caps recovery at exactly one extra cycle so a destination that's truly
+  // gone fails fast instead of looping rediscovery forever.
+  bool          isRecoveryAttempt;
 };
 PendingAckItem pendingAcks[MAX_PENDING_ACK];
 
@@ -405,6 +418,10 @@ struct PendingRouteItem {
   uint8_t       buf[MAX_PACKET_SIZE];
   uint8_t       len;
   unsigned long requestedAt;
+  // [STEP 4A FIX #3] Carried over from the PendingAckItem that triggered
+  // this rediscovery, so the resend it eventually flushes into is correctly
+  // marked as a recovery attempt too (see PendingAckItem.isRecoveryAttempt).
+  bool          isRecoveryAttempt;
 };
 PendingRouteItem pendingRoutes[MAX_PENDING_ROUTE];
 
@@ -432,18 +449,16 @@ unsigned long yellowBlinkNext = 0;
 
 void setLedState(LedState s) { requestedLedState = s; }
 
-// 2 blinks (4 on/off transitions) — message delivered.
 void triggerGreenConfirm() {
-  greenBlinkCount = 4;
+  greenBlinkCount = 6;
   greenBlinkOn    = false;
   greenBlinkNext  = millis();
 }
 
-// 3 blinks (6 on/off transitions) — emergency/SOS activity.
 void triggerEmergencyBlink() {
   stateAfterEmerg = requestedLedState;
   setLedState(LED_EMERGENCY);
-  redBlinkCount = 6;
+  redBlinkCount = 10;
   redBlinkOn    = true;
   redBlinkNext  = millis();
   digitalWrite(LED_RED, HIGH);
@@ -536,6 +551,9 @@ unsigned long lastMsgTime        = 0;
 bool lastSosState  = HIGH;
 
 bool          isScanning = false;
+// [STEP 4A FIX #2] When isScanning was last (re)armed; loop() auto-clears
+// isScanning once `now >= scanEndsAt`, regardless of what triggered the scan.
+unsigned long scanEndsAt  = 0;
 
 int           sosRepeatsLeft  = 0;
 unsigned long sosRepeatNext   = 0;
@@ -828,19 +846,25 @@ bool forwardUnicast(MeshHeader h, const uint8_t* payload) {
 // END-TO-END RELIABILITY: pending ACK + pending route-discovery tables
 // ════════════════════════════════════════════════════════════════════════
 
-void addPendingAck(uint16_t msgId, const char* dest, const uint8_t* buf, uint8_t len) {
+// NOTE: no default argument on isRecoveryAttempt — the Arduino IDE's
+// auto-generated function prototype would duplicate it and fail to compile
+// ("default argument given for parameter ... after previous specification").
+// Every call site below passes it explicitly instead.
+void addPendingAck(uint16_t msgId, const char* dest, const uint8_t* buf, uint8_t len,
+                   bool isRecoveryAttempt) {
   int freeSlot = -1;
   for (int i = 0; i < MAX_PENDING_ACK; i++) {
     if (!pendingAcks[i].inUse) { freeSlot = i; break; }
   }
   if (freeSlot < 0) freeSlot = 0; // table full — overwrite oldest, best-effort
-  pendingAcks[freeSlot].inUse       = true;
-  pendingAcks[freeSlot].msgId       = msgId;
+  pendingAcks[freeSlot].inUse             = true;
+  pendingAcks[freeSlot].msgId             = msgId;
   strncpy(pendingAcks[freeSlot].dest, dest, NODE_ID_LEN); pendingAcks[freeSlot].dest[NODE_ID_LEN] = '\0';
   memcpy(pendingAcks[freeSlot].buf, buf, len);
-  pendingAcks[freeSlot].len         = len;
-  pendingAcks[freeSlot].retriesLeft = MAX_SEND_RETRIES;
-  pendingAcks[freeSlot].nextRetryAt = millis() + ACK_TIMEOUT_MS;
+  pendingAcks[freeSlot].len               = len;
+  pendingAcks[freeSlot].retriesLeft       = MAX_SEND_RETRIES;
+  pendingAcks[freeSlot].nextRetryAt       = millis() + ACK_TIMEOUT_MS;
+  pendingAcks[freeSlot].isRecoveryAttempt = isRecoveryAttempt;
 }
 
 void resolvePendingAck(const char* dest, uint16_t msgId) {
@@ -859,9 +883,23 @@ void pendingAckTick() {
     if (now < pendingAcks[i].nextRetryAt) continue;
 
     if (pendingAcks[i].retriesLeft == 0) {
-      // Exhausted retries — the destination (or the path to it) is gone.
+      // Retries exhausted on the CURRENT route — it's broken (relay moved /
+      // died / RF changed). Always invalidate it so nothing else keeps
+      // using a known-bad path.
       invalidateRoute(pendingAcks[i].dest);
-      reportDeliveryFailed(pendingAcks[i].dest);
+
+      // [STEP 4A FIX #3] Route recovery: before giving up, try exactly ONE
+      // fresh route discovery + redelivery cycle. flushPendingRouteFor()/
+      // pendingRouteTick() above are what actually resend it once a new
+      // route is found (or report failure if rediscovery itself times out).
+      // isRecoveryAttempt blocks this from happening more than once per
+      // message — if the retry-of-the-retry also exhausts, we fail here
+      // instead of rediscovering again, so this can never loop forever.
+      if (!pendingAcks[i].isRecoveryAttempt) {
+        addPendingRoute(pendingAcks[i].dest, pendingAcks[i].buf, pendingAcks[i].len, true);
+      } else {
+        reportDeliveryFailed(pendingAcks[i].dest);
+      }
       pendingAcks[i].inUse = false;
       continue;
     }
@@ -871,17 +909,19 @@ void pendingAckTick() {
   }
 }
 
-void addPendingRoute(const char* dest, const uint8_t* buf, uint8_t len) {
+// NOTE: no default argument on isRecoveryAttempt (see addPendingAck note above).
+void addPendingRoute(const char* dest, const uint8_t* buf, uint8_t len, bool isRecoveryAttempt) {
   int freeSlot = -1;
   for (int i = 0; i < MAX_PENDING_ROUTE; i++) {
     if (!pendingRoutes[i].inUse) { freeSlot = i; break; }
   }
   if (freeSlot < 0) freeSlot = 0;
-  pendingRoutes[freeSlot].inUse = true;
+  pendingRoutes[freeSlot].inUse             = true;
   strncpy(pendingRoutes[freeSlot].dest, dest, NODE_ID_LEN); pendingRoutes[freeSlot].dest[NODE_ID_LEN] = '\0';
   memcpy(pendingRoutes[freeSlot].buf, buf, len);
-  pendingRoutes[freeSlot].len = len;
-  pendingRoutes[freeSlot].requestedAt = millis();
+  pendingRoutes[freeSlot].len               = len;
+  pendingRoutes[freeSlot].requestedAt       = millis();
+  pendingRoutes[freeSlot].isRecoveryAttempt = isRecoveryAttempt;
   sendRREQ(dest);
 }
 
@@ -892,9 +932,12 @@ void pendingRouteTick() {
 
     RouteEntry* r = findRoute(pendingRoutes[i].dest);
     if (r) {
-      // Route arrived — flush the buffered message now.
+      // Route arrived — flush the buffered message now. Carry the
+      // recovery flag through so a second failure on this same message
+      // reports failure immediately instead of rediscovering again.
       MeshHeader h; decodeHeader(pendingRoutes[i].buf, h);
-      addPendingAck(h.msgId, pendingRoutes[i].dest, pendingRoutes[i].buf, pendingRoutes[i].len);
+      addPendingAck(h.msgId, pendingRoutes[i].dest, pendingRoutes[i].buf, pendingRoutes[i].len,
+                    pendingRoutes[i].isRecoveryAttempt);
       enqueueRaw(pendingRoutes[i].buf, pendingRoutes[i].len, PRIO_NORMAL, false);
       pendingRoutes[i].inUse = false;
       continue;
@@ -912,7 +955,8 @@ void flushPendingRouteFor(const char* dest) {
   for (int i = 0; i < MAX_PENDING_ROUTE; i++) {
     if (pendingRoutes[i].inUse && strcmp(pendingRoutes[i].dest, dest) == 0) {
       MeshHeader h; decodeHeader(pendingRoutes[i].buf, h);
-      addPendingAck(h.msgId, dest, pendingRoutes[i].buf, pendingRoutes[i].len);
+      addPendingAck(h.msgId, dest, pendingRoutes[i].buf, pendingRoutes[i].len,
+                    pendingRoutes[i].isRecoveryAttempt);
       enqueueRaw(pendingRoutes[i].buf, pendingRoutes[i].len, PRIO_NORMAL, false);
       pendingRoutes[i].inUse = false;
     }
@@ -954,10 +998,10 @@ void sendAppMessage(const char* recipient, const char* data) {
   RouteEntry* r = findRoute(recipient);
   if (r) {
     enqueueRaw(buf, totalLen, priority, false);
-    addPendingAck(h.msgId, recipient, buf, totalLen);
+    addPendingAck(h.msgId, recipient, buf, totalLen, false);
   } else {
     // No known route yet — buffer the message and go find one.
-    addPendingRoute(recipient, buf, totalLen);
+    addPendingRoute(recipient, buf, totalLen, false);
   }
 }
 
@@ -1006,6 +1050,20 @@ void handleReceivedPacket(const uint8_t* buf, int len, int16_t rssi, float snr) 
 
     case PKT_HELLO: {
       setNeighborBattery(h.src, payload[0]);
+
+      // [STEP 4A FIX #1] Relay this direct neighbor's RSSI/SNR to the phone.
+      // HELLO already travels every HELLO_INTERVAL_MS regardless — this adds
+      // NO new LoRa traffic, just one small WS frame over the local WiFi
+      // link to whichever phone is already connected. Lets the app refresh
+      // signal quality (and reachability) for a paired direct neighbor
+      // without ever sending an app-triggered discovery ping.
+      doc.clear();
+      doc["type"]     = "neighbor";
+      doc["deviceId"] = h.src;
+      doc["rssi"]     = rssi;
+      doc["snr"]      = snr;
+      String out; serializeJson(doc, out);
+      wsBroadcast(out);
       break; // TTL=1, never forwarded
     }
 
@@ -1119,6 +1177,7 @@ void onUserSinglePress() {
   Serial.println("[BTN] Single press -> toggle mesh discovery scan");
   if (!isScanning) {
     isScanning = true;
+    scanEndsAt = millis() + DISCOVER_SCAN_WINDOW_MS;
     setLedState(LED_SCANNING);
     sendDiscoverFlood();
     doc.clear(); doc["type"] = "discover";
@@ -1132,6 +1191,7 @@ void onUserSinglePress() {
 void onUserDoublePress() {
   Serial.println("[BTN] Double press -> reconnect / reset mesh discovery");
   isScanning = true;
+  scanEndsAt = millis() + DISCOVER_SCAN_WINDOW_MS;
   setLedState(LED_SCANNING);
   sendDiscoverFlood();
   doc.clear(); doc["type"] = "reconnect";
@@ -1244,6 +1304,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
       }
       else if (strcmp(msgType, "discover") == 0) {
         isScanning = true;
+        scanEndsAt = millis() + DISCOVER_SCAN_WINDOW_MS;
         setLedState(LED_SCANNING);
         sendDiscoverFlood();
       }
@@ -1318,6 +1379,15 @@ void loop() {
 
   ledUpdate();
   userBtnUpdate();
+
+  // ── [STEP 4A FIX #2] Auto-clear scanning mode ───────────────────────
+  // Whatever triggered scanning (app WS "discover", physical single- or
+  // double-press), isScanning auto-clears once its window expires, instead
+  // of relying on the user pressing the button again to toggle it off.
+  if (isScanning && now >= scanEndsAt) {
+    isScanning = false;
+    setLedState((connectedClients > 0) ? LED_NORMAL : LED_WARNING);
+  }
 
   // ── Periodic neighbour beacon ──────────────────────────────────────
   if (now - lastHelloAt > HELLO_INTERVAL_MS) {

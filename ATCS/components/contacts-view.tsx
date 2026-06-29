@@ -201,13 +201,13 @@ export function ContactsView({
                       </Avatar>
                       {/* [v6] Range-aware status dot. The Emergency channel ("*")
                           is a pseudo-node with no real link, so it keeps a static
-                          green dot; real nodes show online/weak/out-of-range. */}
+                          green dot; real nodes show online/stale/offline reachability. */}
                       {contact.deviceId === "*" ? (
                         <div className="absolute -bottom-0.5 -right-0.5 h-3.5 w-3.5 bg-emerald-500 rounded-full border-2 border-gray-800" />
                       ) : (
                         <SignalIndicator
                           variant="dot"
-                          status={contact.status}
+                          reachability={contact.reachability}
                           className="absolute -bottom-0.5 -right-0.5"
                         />
                       )}
@@ -238,14 +238,17 @@ export function ContactsView({
                           </>
                         )}
                       </p>
-                      {/* [v6] Range/signal status line (skip for the Emergency
-                          pseudo-node). Shows online/weak/out-of-range + bars + RSSI. */}
+                      {/* [STEP 4A] Reachability + signal quality shown independently
+                          (skip for the Emergency pseudo-node). */}
                       {contact.deviceId !== "*" && (
                         <div className="mt-0.5">
                           <SignalIndicator
                             variant="full"
-                            status={contact.status}
+                            reachability={contact.reachability}
+                            signalQuality={contact.signalQuality}
                             rssi={contact.rssi}
+                            signalSampledAt={contact.signalSampledAt}
+                            signalHopDistance={contact.signalHopDistance}
                           />
                         </div>
                       )}

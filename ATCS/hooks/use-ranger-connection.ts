@@ -61,7 +61,12 @@ export type RangerEvent =
   | { kind: "location-broadcast"; sender: string; lat: number; lng: number; accuracy: number }
   | { kind: "frequency-update";   frequency: number }
   | { kind: "delivery-confirmed" }
-  | { kind: "node-discovered";    deviceId: string; rssi?: number; snr?: number }
+  // [STEP 4A] hops: how many mesh hops away the discovered node is. Used to
+  // tag the RSSI reading as direct (0) vs relayed (>0) — see signalHopDistance.
+  | { kind: "node-discovered";    deviceId: string; rssi?: number; snr?: number; hops?: number }
+  // [STEP 4A] Relayed RSSI/SNR from a direct neighbor's HELLO beacon — no new
+  // LoRa traffic, just the firmware forwarding a reading it already had.
+  | { kind: "neighbor-heard";     deviceId: string; rssi?: number; snr?: number }
   // [NEW] Another node sent us a ##PAIR_REQ## over LoRa.
   | { kind: "pair-request";       sender: string; senderName: string }
   // [NEW] A node we paired with replied with ##PAIR_ACK## — add them to contacts.
@@ -343,6 +348,18 @@ export function useRangerConnection({
             deviceId: (frame.deviceId as string) ?? "",
             rssi:     frame.rssi as number | undefined,
             snr:      frame.snr  as number | undefined,   // [v6] forward SNR
+            hops:     frame.hops as number | undefined,    // [STEP 4A]
+          });
+          break;
+        }
+
+        // [STEP 4A] Relayed HELLO reading for a direct neighbor.
+        case "neighbor": {
+          emit({
+            kind:     "neighbor-heard",
+            deviceId: (frame.deviceId as string) ?? "",
+            rssi:     frame.rssi as number | undefined,
+            snr:      frame.snr  as number | undefined,
           });
           break;
         }

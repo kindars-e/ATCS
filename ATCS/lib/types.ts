@@ -7,30 +7,38 @@ export type Contact = {
   lastSeen?: Date;
   unreadCount: number;
   avatar?: string;
-  // [v6] status now includes range-aware values. The legacy values
-  // ("online"/"offline"/"away") are kept so existing code keeps compiling; the
-  // range monitor assigns the new "weak"/"out-of-range" values. See RangeStatus.
-  status?: RangeStatus;
-  location?: ContactLocation;
-  // [v6 DIAGNOSTICS] Latest signal readings from the firmware for this node.
+  // [STEP 4A] Reachability — derived ONLY from lastSeen + elapsed time.
+  // Signal strength must never influence this value (see classifyReachability
+  // in fling-app.tsx). Replaces the old combined RangeStatus field.
+  reachability?: ReachabilityStatus;
+  // [STEP 4A DIAGNOSTICS] Latest signal readings from the firmware for this
+  // node, and signalQuality — derived ONLY from rssi/snr (see
+  // classifySignalQuality in fling-app.tsx). Elapsed time must never
+  // influence this value; use signalSampledAt to judge how fresh it is.
   //   rssi: dBm, always negative; closer to 0 = stronger (e.g. -55 strong, -110 weak)
   //   snr:  dB, signal vs noise; higher = cleaner (LoRa decodes down to ~ -20 dB)
-  // Undefined until we've received at least one packet from the node.
+  // All undefined until we've received at least one signal-bearing frame
+  // (message, discovery reply, or a relayed HELLO) from the node.
   rssi?: number;
   snr?: number;
+  signalQuality?: SignalQuality;
+  signalSampledAt?: Date;     // when rssi/snr was actually measured
+  signalHopDistance?: number; // 0 = direct neighbor (HELLO-relay), >0 = relayed/multi-hop
+  location?: ContactLocation;
 };
 
-// [v6] All possible per-node link statuses.
-//   online       – heard recently AND signal good
-//   weak         – reachable but poor signal OR not heard in a while (fragile)
-//   out-of-range – not heard for a long time; assumed unreachable
-//   offline/away – legacy values, still accepted so older code compiles
-export type RangeStatus =
-  | "online"
-  | "weak"
-  | "out-of-range"
-  | "offline"
-  | "away";
+// [STEP 4A] Time-only reachability. Never influenced by signal strength.
+//   online  – heard from within NODE_STALE_MS
+//   stale   – not heard from in a while, but not yet given up on
+//   offline – not heard from in NODE_OFFLINE_MS or longer; assumed unreachable
+export type ReachabilityStatus = "online" | "stale" | "offline";
+
+// [STEP 4A] Signal-only quality. Never influenced by time since last contact.
+//   strong  – excellent RSSI
+//   good    – usable, comfortable margin
+//   weak    – fragile but technically working
+//   unknown – no rssi reading has ever arrived for this node yet
+export type SignalQuality = "strong" | "good" | "weak" | "unknown";
 
 export type ContactLocation = {
   lat: number;
