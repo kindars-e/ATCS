@@ -42,6 +42,11 @@ import {
 import {
   DISCOVERY_SCAN_DURATION_MS,
   EMERGENCY_BROADCAST_ID,
+  LIVE_SHARE_CHECK_INTERVAL_MS,
+  LIVE_SHARE_HEARTBEAT_MS,
+  LOCATION_REQUEST_TIMEOUT_MS,
+  MAX_USEFUL_GPS_ACCURACY_M,
+  MIN_LOCATION_MOVE_M,
   NODE_OFFLINE_MS,
   NODE_STALE_MS,
   RADIO_BANDWIDTH_HZ,
@@ -50,6 +55,7 @@ import {
   RANGE_CHECK_INTERVAL_MS,
   RSSI_STRONG_DBM,
   RSSI_WEAK_DBM,
+  SOS_LOCATION_DEBOUNCE_MS,
   SPLASH_DURATION_MS,
 } from "@/lib/constants";
 import {
@@ -57,10 +63,12 @@ import {
   encodeDiscovery,
   encodeLocationRequest,
   encodeLocationResponse,
+  encodeLocationStop,
   encodeTextMessage,
   encodePairRequest,
   encodePairAccept,
 } from "@/lib/protocol";
+import { calculateDistance } from "@/lib/geo";
 import { readContacts, writeContacts, readMessages, writeMessages } from "@/lib/storage";
 import type {
   Contact,
@@ -79,9 +87,7 @@ import { SplashScreen }    from "./splash-screen";
 import { CompassModal }    from "./compass-modal";
 import { ContactsView }    from "./contacts-view";
 import { ChatView }        from "./chat-view";
-
-// How often the responder re-broadcasts their live GPS location (ms).
-const LIVE_LOCATION_INTERVAL_MS = 3000;
+import { NodeStatsModal }  from "./node-stats-modal";
 
 // ── Emergency Broadcast contact (always present, never persisted) ────────────
 const EMERGENCY_CONTACT: Contact = {
@@ -142,6 +148,12 @@ export default function FlingApp() {
   // [v6 RANGE DETECTION] Transient banner shown when a node's reachability
   // changes (e.g. "Ranger B is out of range"). Auto-clears after a few seconds.
   const [rangeNotice, setRangeNotice] = useState<string | null>(null);
+  // [STEP 4B] Transient banner for a permanently-failed delivery. Separate
+  // from rangeNotice since it's triggered by a different signal and we don't
+  // want one to silently clobber the other if both fire close together.
+  const [deliveryNotice, setDeliveryNotice] = useState<string | null>(null);
+  // [STEP 4B] Node diagnostics modal toggle.
+  const [showNodeStats, setShowNodeStats] = useState(false);
 
   // Location state
   const [showLocationRequest,      setShowLocationRequest]      = useState(false);
@@ -153,10 +165,37 @@ export default function FlingApp() {
   const [incomingLocationRequest,  setIncomingLocationRequest]  = useState<
     { from: string; deviceName: string } | null
   >(null);
+  // [STEP 6] Transient banner for location-session events (e.g. "X stopped
+  // sharing their location") — same pattern as rangeNotice/deliveryNotice.
+  const [locationNotice, setLocationNotice] = useState<string | null>(null);
 
-  const liveShareIntervalRef     = useRef<ReturnType<typeof setInterval> | null>(null);
+  // [STEP 6] Live-share session state, mutated in place (a ref, not React
+  // state) since it's read/written from timer callbacks and geolocation
+  // callbacks, not rendered directly.
+  //   targetId         — who we're sharing with
+  //   lastSentAt        — ms timestamp of the last successfully sent fix
+  //   lastSentPosition  — used to decide whether we've moved far enough to
+  //                       justify sending again (event-driven, not fixed-interval)
+  //   status            — "paused" while the WS connection is down; the
+  //                       reconnect-recovery effect flips it back to
+  //                       "active" and resumes immediately
+  interface LiveShareSession {
+    targetId: string;
+    lastSentAt: number;
+    lastSentPosition: { lat: number; lng: number } | null;
+    status: "active" | "paused";
+  }
+  const liveShareSessionRef      = useRef<LiveShareSession | null>(null);
+  const liveShareCheckTimerRef   = useRef<ReturnType<typeof setInterval> | null>(null);
   const liveShareTargetRef       = useRef<string | null>(null);
   const locationRequestTargetRef = useRef<Contact | null>(null);
+  // [STEP 6] Timeout handling for a one-time location request — fires if
+  // the other side never responds.
+  const locationRequestTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // [STEP 6] Debounces the automatic SOS location ping (see the "text"
+  // event handler) so the firmware's 3x SOS resend doesn't trigger 3
+  // separate location broadcasts for one logical emergency.
+  const lastSosLocationRef = useRef<{ sender: string; at: number }>({ sender: "", at: 0 });
 
   // Discovery state
   const [isDiscovering,   setIsDiscovering]   = useState(false);
@@ -238,6 +277,20 @@ export default function FlingApp() {
     return () => clearTimeout(id);
   }, [rangeNotice]);
 
+  // [STEP 4B] Auto-dismiss the delivery-failed banner.
+  useEffect(() => {
+    if (!deliveryNotice) return;
+    const id = setTimeout(() => setDeliveryNotice(null), 5000);
+    return () => clearTimeout(id);
+  }, [deliveryNotice]);
+
+  // [STEP 6] Auto-dismiss the location-session banner.
+  useEffect(() => {
+    if (!locationNotice) return;
+    const id = setTimeout(() => setLocationNotice(null), 5000);
+    return () => clearTimeout(id);
+  }, [locationNotice]);
+
   useEffect(() => {
     if (!showDeleteMenu) return;
     const fn = () => setShowDeleteMenu(null);
@@ -269,16 +322,25 @@ export default function FlingApp() {
 
   useEffect(() => {
     return () => {
-      if (liveShareIntervalRef.current) clearInterval(liveShareIntervalRef.current);
+      if (liveShareCheckTimerRef.current) clearInterval(liveShareCheckTimerRef.current);
     };
   }, []);
 
-  // ── [FIX 3 carried forward] Master location state reset ───────────────────
+  // ── [STEP 6] Master location state reset — the "fully tear down" option,
+  // used for WiFi-level disconnects and explicit user cancellation. A
+  // transient WS-level hiccup is handled separately (see the isOnline
+  // recovery effect below) and does NOT call this — it pauses/resumes the
+  // live-share session in place instead of discarding it. ──────────────────
   const resetAllLocationState = useCallback(() => {
-    if (liveShareIntervalRef.current) {
-      clearInterval(liveShareIntervalRef.current);
-      liveShareIntervalRef.current = null;
+    if (liveShareCheckTimerRef.current) {
+      clearInterval(liveShareCheckTimerRef.current);
+      liveShareCheckTimerRef.current = null;
     }
+    if (locationRequestTimeoutRef.current) {
+      clearTimeout(locationRequestTimeoutRef.current);
+      locationRequestTimeoutRef.current = null;
+    }
+    liveShareSessionRef.current      = null;
     liveShareTargetRef.current       = null;
     locationRequestTargetRef.current = null;
     setShowLocationPermission(false);
@@ -340,9 +402,12 @@ export default function FlingApp() {
   //     Otherwise the previous reading (and its age) is left exactly as-is
   //     — we never fabricate or silently "refresh" a signal value just
   //     because the node proved reachable some other way.
+  //   - battery ([STEP 4B]): only touched when THIS event actually carried
+  //     a battery reading (discovery reply or relayed HELLO); otherwise the
+  //     previous value is kept.
   // ════════════════════════════════════════════════════════════════════════
   const recordNodeHeard = useCallback(
-    (deviceId: string, rssi?: number, snr?: number, hopDistance?: number) => {
+    (deviceId: string, rssi?: number, snr?: number, hopDistance?: number, battery?: number) => {
       if (!deviceId || deviceId === EMERGENCY_BROADCAST_ID) return;
       const now = new Date();
       const hasSample = rssi !== undefined;
@@ -358,6 +423,7 @@ export default function FlingApp() {
                 signalSampledAt:    hasSample ? now            : c.signalSampledAt,
                 signalHopDistance:  hasSample ? hopDistance    : c.signalHopDistance,
                 signalQuality:      hasSample ? classifySignalQuality(rssi) : c.signalQuality,
+                battery:            battery ?? c.battery,
               }
             : c,
         ),
@@ -379,6 +445,17 @@ export default function FlingApp() {
         // [v6 RANGE DETECTION] A received message proves this node is reachable,
         // so refresh its signal readings + lastSeen + status right away.
         recordNodeHeard(senderId, event.rssi, event.snr);
+
+        // [STEP 6] Fix the Beep/"Find" button: it was sending literal text
+        // "BEEP" which just showed up as a chat bubble — not the buzz the
+        // UI's own label promises. Beep is always 1:1 (never broadcast), so
+        // it's safe to special-case here without touching the protocol.
+        if (!event.broadcast && event.content === "BEEP") {
+          if (typeof navigator !== "undefined" && "vibrate" in navigator) {
+            navigator.vibrate([200, 100, 200]);
+          }
+          return;
+        }
 
         // ──────────────────────────────────────────────────────────────────
         // [FIXED] EMERGENCY BROADCAST ROUTING
@@ -409,6 +486,32 @@ export default function FlingApp() {
           isBroadcast &&
           !!myDeviceIdRef.current &&
           senderId === myDeviceIdRef.current;
+
+        // [STEP 6] Automatically follow up our own emergency broadcast with
+        // one best-effort GPS fix, broadcast the same way — no separate
+        // request/approval round-trip needed during an actual emergency
+        // (the sender may not be able to respond to a permission prompt).
+        // Debounced per-sender so the firmware's 3x SOS resend (same
+        // logical event, same msgId) can't trigger 3 separate broadcasts.
+        if (isOwnEcho) {
+          const now = Date.now();
+          if (now - lastSosLocationRef.current.at > SOS_LOCATION_DEBOUNCE_MS) {
+            lastSosLocationRef.current = { sender: senderId, at: now };
+            if (typeof navigator !== "undefined" && navigator.geolocation) {
+              navigator.geolocation.getCurrentPosition(
+                (pos) => {
+                  // [STEP 6] Emergency exception to GPS accuracy validation:
+                  // any fix is better than none on an SOS — unlike normal
+                  // sharing, this is never held back for poor accuracy.
+                  const { latitude, longitude, accuracy } = pos.coords;
+                  sendFrame(encodeLocationResponse(EMERGENCY_BROADCAST_ID, latitude, longitude, accuracy));
+                },
+                () => { /* no GPS available — the SOS itself already went out; never block on this */ },
+                { enableHighAccuracy: true, timeout: 8000, maximumAge: 10000 },
+              );
+            }
+          }
+        }
 
         // The thread this message will be stored under.
         const threadId = isBroadcast ? EMERGENCY_BROADCAST_ID : senderId;
@@ -522,6 +625,9 @@ export default function FlingApp() {
         return;
       }
 
+      // [STEP 6] Handles BOTH a normal 1:1 response and a broadcast SOS
+      // location ping (event.broadcast) — either way, a fresh fix for
+      // event.sender is real and worth storing.
       case "location-response": {
         recordNodeHeard(event.sender); // [v6] a reply proves reachability
         const newLocation: ContactLocation = {
@@ -539,6 +645,10 @@ export default function FlingApp() {
           prev?.deviceId === event.sender ? { ...prev, location: newLocation } : prev,
         );
         if (locationRequestTargetRef.current?.deviceId === event.sender) {
+          if (locationRequestTimeoutRef.current) {
+            clearTimeout(locationRequestTimeoutRef.current);
+            locationRequestTimeoutRef.current = null;
+          }
           setLocationRequestStatus("success");
           setLocationDebugMessage("🎯 Live tracking started!");
           setShowLocationRequest(false);
@@ -548,23 +658,15 @@ export default function FlingApp() {
         return;
       }
 
-      case "location-broadcast": {
-        recordNodeHeard(event.sender); // [v6] a broadcast proves reachability
-        setContacts((prev) =>
-          prev.map((c) =>
-            c.deviceId === event.sender
-              ? {
-                  ...c,
-                  location: {
-                    lat:       event.lat,
-                    lng:       event.lng,
-                    accuracy:  event.accuracy,
-                    timestamp: new Date(),
-                  },
-                }
-              : c,
-          ),
-        );
+      // [STEP 6] The responder explicitly ended a live-share session —
+      // surface it instead of letting the location silently go stale with
+      // no explanation. We deliberately keep the last known location (still
+      // useful) rather than clearing it; the Compass modal's own staleness
+      // display communicates that it's no longer live.
+      case "location-stop": {
+        const name = contactsRef.current.find((c) => c.deviceId === event.sender)?.deviceName
+          || `Ranger ${event.sender}`;
+        setLocationNotice(`${name} stopped sharing their location`);
         return;
       }
 
@@ -585,17 +687,57 @@ export default function FlingApp() {
         return;
       }
 
+      // [STEP 4B] Unicast delivery permanently failed. Unlike
+      // delivery-confirmed above, this is NOT gated on "is that chat
+      // currently open" — the user needs to know even if they've navigated
+      // away, so we look the message up directly by dest and also raise a
+      // visible notice.
+      case "delivery-failed": {
+        const dest = event.dest;
+        if (dest) {
+          const lastId = lastSentIdRef.current[dest];
+          if (lastId) {
+            setMessages((msgs) => ({
+              ...msgs,
+              [dest]: (msgs[dest] || []).map((m) =>
+                m.id === lastId ? { ...m, status: "failed" as const } : m,
+              ),
+            }));
+          }
+          const name = contactsRef.current.find((c) => c.deviceId === dest)?.deviceName || `Ranger ${dest}`;
+          setDeliveryNotice(`Message to ${name} could not be delivered`);
+        }
+        return;
+      }
+
+      // [STEP 4B] One node confirmed it received our SOS broadcast. Flips
+      // the most recently sent Emergency-thread message to "delivered" on
+      // the FIRST confirmation; later confirmations from other nodes are a
+      // harmless no-op (the message is already marked delivered).
+      case "sos-delivered": {
+        const lastId = lastSentIdRef.current[EMERGENCY_BROADCAST_ID];
+        if (lastId) {
+          setMessages((msgs) => ({
+            ...msgs,
+            [EMERGENCY_BROADCAST_ID]: (msgs[EMERGENCY_BROADCAST_ID] || []).map((m) =>
+              m.id === lastId ? { ...m, status: "delivered" as const } : m,
+            ),
+          }));
+        }
+        return;
+      }
+
       case "node-discovered": {
         // [NEW] Accumulate discovered nodes across multiple scan windows.
         // We never clear the list here — the modal manages that via resetDiscovery.
         setDiscoveredNodes((prev) => {
           if (prev.some((n) => n.deviceId === event.deviceId)) return prev;
-          return [...prev, { deviceId: event.deviceId, rssi: event.rssi }];
+          return [...prev, { deviceId: event.deviceId, rssi: event.rssi, battery: event.battery }];
         });
         // [v6] If this node is already a saved contact, a discovery reply also
         // proves it's reachable — refresh its reachability + signal reading.
         // hops tags the reading as direct (0) vs relayed (>0).
-        recordNodeHeard(event.deviceId, event.rssi, event.snr, event.hops);
+        recordNodeHeard(event.deviceId, event.rssi, event.snr, event.hops, event.battery);
         return;
       }
 
@@ -604,7 +746,7 @@ export default function FlingApp() {
       // already had from its existing HELLO_INTERVAL_MS beacon. hopDistance
       // is always 0 here since HELLO is direct-neighbor-only (TTL=1).
       case "neighbor-heard": {
-        recordNodeHeard(event.deviceId, event.rssi, event.snr, 0);
+        recordNodeHeard(event.deviceId, event.rssi, event.snr, 0, event.battery);
         return;
       }
 
@@ -667,6 +809,8 @@ export default function FlingApp() {
     isOnline,
     connectedDeviceId,
     connectedDeviceName,
+    connectedDeviceBattery,
+    nodeStats,
     lastConnectionError,
     reconnectAttempts,
     send:     sendFrame,
@@ -844,10 +988,28 @@ export default function FlingApp() {
   };
 
   // ════════════════════════════════════════════════════════════════════════
-  // LOCATION SHARING (unchanged from previous fix pass)
+  // [STEP 6] LOCATION SHARING
+  //
+  // Both directions (one-time request/response and live sharing) are still
+  // just chat-style text messages riding the SAME generic mesh-routed "send"
+  // path used for everything else — the firmware has no location-specific
+  // code at all, so every reliability behavior below (timeouts, duplicate
+  // protection, staleness, accuracy gating, reconnect recovery) is purely
+  // app-level policy layered on top of an already mesh-hardened transport.
+  // No firmware change was needed for any of this.
   // ════════════════════════════════════════════════════════════════════════
   const requestLocation = () => {
     if (!currentContact) return;
+
+    // [STEP 6] Duplicate request protection — ignore a second tap while a
+    // request to this SAME contact is already in flight.
+    if (
+      locationRequestTargetRef.current?.deviceId === currentContact.deviceId &&
+      (locationRequestStatus === "requesting" || locationRequestStatus === "waiting")
+    ) {
+      return;
+    }
+
     if (!isOnline) {
       alert("Connection to Ranger network is down. Cannot send location request.");
       return;
@@ -860,47 +1022,85 @@ export default function FlingApp() {
 
     const sent = sendFrame(encodeLocationRequest(currentContact.deviceId));
     if (!sent) {
+      setLocationRequestStatus("error");
       setLocationDebugMessage("Connection lost. Please try again.");
-      setTimeout(() => {
-        setShowLocationRequest(false);
-        setLocationDebugMessage("");
-        locationRequestTargetRef.current = null;
-      }, 2000);
       return;
     }
     setLocationRequestStatus("waiting");
     setLocationDebugMessage(`Waiting for ${currentContact.deviceName} to approve…`);
+
+    // [STEP 6] Timeout handling — don't spin on "Waiting for Response"
+    // forever if they never approve (closed the app, out of range, etc).
+    locationRequestTimeoutRef.current = setTimeout(() => {
+      setLocationRequestStatus("error");
+      setLocationDebugMessage("No response — they may be offline or out of range.");
+    }, LOCATION_REQUEST_TIMEOUT_MS);
   };
 
-  const stopLiveShare = useCallback(() => {
-    resetAllLocationState();
-  }, [resetAllLocationState]);
-
-  const acceptLocationShare = useCallback(() => {
-    if (!incomingLocationRequest) return;
-    if (!navigator.geolocation) {
-      setLocationDebugMessage("Geolocation not supported on this device.");
-      return;
+  // [STEP 6] Tied to connection state — a WS drop while genuinely waiting
+  // on a response is a real failure, not something to silently hang on.
+  useEffect(() => {
+    if (!isOnline && (locationRequestStatus === "requesting" || locationRequestStatus === "waiting")) {
+      if (locationRequestTimeoutRef.current) {
+        clearTimeout(locationRequestTimeoutRef.current);
+        locationRequestTimeoutRef.current = null;
+      }
+      setLocationRequestStatus("error");
+      setLocationDebugMessage("Connection lost while waiting for a response.");
     }
-    const targetId = incomingLocationRequest.from;
-    liveShareTargetRef.current = targetId;
-    setLocationDebugMessage("Getting your location…");
-    let firstSent = false;
+  }, [isOnline, locationRequestStatus]);
 
-    const sendCurrentPosition = () => {
+  const stopLiveShare = useCallback(() => {
+    // [STEP 6] Tell the requester explicitly, best-effort — if this
+    // particular packet doesn't make it, their own staleness display
+    // (Compass modal) will convey the same thing a bit later anyway.
+    const session = liveShareSessionRef.current;
+    if (session) sendFrame(encodeLocationStop(session.targetId));
+    resetAllLocationState();
+  }, [sendFrame, resetAllLocationState]);
+
+  // [STEP 6] One GPS read + one (gated) send. Shared by both the initial
+  // accept-and-share-once call and the recurring adaptive check below, so
+  // both paths apply the exact same accuracy validation and exact same
+  // "don't lie about success" UI feedback.
+  const tryShareCurrentPosition = useCallback(
+    (targetId: string, isFirstSend: boolean) => {
+      if (!navigator.geolocation) {
+        setLocationDebugMessage("Geolocation not supported on this device.");
+        return;
+      }
       navigator.geolocation.getCurrentPosition(
         (pos) => {
           const { latitude, longitude, accuracy } = pos.coords;
-          const sent = sendFrame(encodeLocationResponse(targetId, latitude, longitude, accuracy));
-          if (!sent) {
-            setLocationDebugMessage("Connection lost — stopping live share.");
-            stopLiveShare();
+
+          // [STEP 6] GPS accuracy validation — a fix this poor won't
+          // actually help anyone find this person; hold it back and wait
+          // for a better one instead of burning airtime on it.
+          if (accuracy > MAX_USEFUL_GPS_ACCURACY_M) {
+            setLocationDebugMessage(`Waiting for a better GPS fix (±${Math.round(accuracy)}m)…`);
             return;
           }
-          if (!firstSent) {
-            firstSent = true;
-            setLocationDebugMessage(`Sharing live ✓  (±${Math.round(accuracy)}m)`);
+
+          const sent = sendFrame(encodeLocationResponse(targetId, latitude, longitude, accuracy));
+          if (!sent) {
+            // [STEP 6] Don't claim success when it didn't go through — the
+            // isOnline recovery effect below decides whether to pause the
+            // session or this was just a one-off blip.
+            setLocationDebugMessage("Connection issue — last update did not go through.");
+            return;
           }
+
+          const session = liveShareSessionRef.current;
+          if (session) {
+            session.lastSentAt = Date.now();
+            session.lastSentPosition = { lat: latitude, lng: longitude };
+            session.status = "active";
+          }
+          setLocationDebugMessage(
+            isFirstSend
+              ? `🎯 Sharing live ✓ (±${Math.round(accuracy)}m)`
+              : `Updated ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} (±${Math.round(accuracy)}m)`,
+          );
         },
         (err) => {
           if (err.code === err.PERMISSION_DENIED) {
@@ -912,12 +1112,72 @@ export default function FlingApp() {
         },
         { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 },
       );
-    };
+    },
+    [sendFrame, stopLiveShare],
+  );
 
-    sendCurrentPosition();
-    if (liveShareIntervalRef.current) clearInterval(liveShareIntervalRef.current);
-    liveShareIntervalRef.current = setInterval(sendCurrentPosition, LIVE_LOCATION_INTERVAL_MS);
-  }, [incomingLocationRequest, sendFrame, stopLiveShare]);
+  const acceptLocationShare = useCallback(() => {
+    if (!incomingLocationRequest) return;
+    if (!navigator.geolocation) {
+      setLocationDebugMessage("Geolocation not supported on this device.");
+      return;
+    }
+    const targetId = incomingLocationRequest.from;
+    liveShareTargetRef.current = targetId;
+    liveShareSessionRef.current = {
+      targetId,
+      lastSentAt: 0,
+      lastSentPosition: null,
+      status: "active",
+    };
+    setLocationDebugMessage("Getting your location…");
+
+    tryShareCurrentPosition(targetId, true);
+
+    // [STEP 6] Event-driven, not a fixed-interval blast: this timer just
+    // re-evaluates every LIVE_SHARE_CHECK_INTERVAL_MS whether a fresh fix is
+    // actually WORTH sending — real movement (>= MIN_LOCATION_MOVE_M) OR the
+    // heartbeat elapsed with no movement — instead of unconditionally
+    // transmitting on a fixed clock regardless of whether anything changed.
+    if (liveShareCheckTimerRef.current) clearInterval(liveShareCheckTimerRef.current);
+    liveShareCheckTimerRef.current = setInterval(() => {
+      const session = liveShareSessionRef.current;
+      if (!session || session.status !== "active") return; // paused — connection down
+
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const { latitude, longitude } = pos.coords;
+          const sinceLastSend = Date.now() - session.lastSentAt;
+          const moved = session.lastSentPosition
+            ? calculateDistance(session.lastSentPosition.lat, session.lastSentPosition.lng, latitude, longitude)
+            : Infinity; // no fix sent yet this session — always send the first one
+
+          if (moved >= MIN_LOCATION_MOVE_M || sinceLastSend >= LIVE_SHARE_HEARTBEAT_MS) {
+            tryShareCurrentPosition(targetId, false);
+          }
+        },
+        () => { /* a one-off read failure here just means we try again next tick */ },
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 },
+      );
+    }, LIVE_SHARE_CHECK_INTERVAL_MS);
+  }, [incomingLocationRequest, tryShareCurrentPosition]);
+
+  // [STEP 6] Recovery after temporary connection loss: pause sending while
+  // the WS link is down (no point burning GPS reads we can't transmit
+  // anyway), and resume immediately — not on the next scheduled tick —
+  // the moment it comes back, so the requester doesn't see a multi-minute
+  // gap just because the link blipped for a few seconds.
+  useEffect(() => {
+    const session = liveShareSessionRef.current;
+    if (!session) return;
+    if (!isOnline && session.status === "active") {
+      session.status = "paused";
+      setLocationDebugMessage("Connection lost — will resume sharing automatically.");
+    } else if (isOnline && session.status === "paused") {
+      session.status = "active";
+      tryShareCurrentPosition(session.targetId, false);
+    }
+  }, [isOnline, tryShareCurrentPosition]);
 
   // ════════════════════════════════════════════════════════════════════════
   // WAYPOINT NAVIGATION
@@ -963,6 +1223,32 @@ export default function FlingApp() {
         </div>
       )}
 
+      {/* [STEP 4B] Delivery-failed banner — stacks below the range notice
+          (rare to see both at once) rather than sharing its state, so an
+          unrelated reachability change can never silently swallow this. */}
+      {deliveryNotice && !showSplash && isWiFiConnected && (
+        <div className="fixed top-0 left-0 right-0 z-50 flex justify-center pt-14 px-4 pointer-events-none">
+          <div className="bg-gray-900/95 border border-red-800 text-white text-sm px-4 py-2.5 rounded-xl shadow-lg flex items-center gap-2 animate-[fade-in_0.25s_ease-out]" style={{ marginTop: rangeNotice ? 48 : 0 }}>
+            <span className="h-2 w-2 rounded-full bg-red-500" />
+            {deliveryNotice}
+          </div>
+        </div>
+      )}
+
+      {/* [STEP 6] Location-session banner (e.g. "X stopped sharing their
+          location") — stacks below the other two banners. */}
+      {locationNotice && !showSplash && isWiFiConnected && (
+        <div className="fixed top-0 left-0 right-0 z-50 flex justify-center pt-14 px-4 pointer-events-none">
+          <div
+            className="bg-gray-900/95 border border-blue-800 text-white text-sm px-4 py-2.5 rounded-xl shadow-lg flex items-center gap-2 animate-[fade-in_0.25s_ease-out]"
+            style={{ marginTop: (rangeNotice ? 48 : 0) + (deliveryNotice ? 48 : 0) }}
+          >
+            <span className="h-2 w-2 rounded-full bg-blue-400" />
+            {locationNotice}
+          </div>
+        </div>
+      )}
+
       {showSplash ? (
         <SplashScreen />
       ) : !isWiFiConnected ? (
@@ -975,6 +1261,8 @@ export default function FlingApp() {
           connectionState={connectionState}
           reconnectAttempts={reconnectAttempts}
           lastConnectionError={lastConnectionError}
+          connectedDeviceBattery={connectedDeviceBattery}
+          onShowNodeStats={() => setShowNodeStats(true)}
           showDeleteMenu={showDeleteMenu}
           onToggleDeleteMenu={setShowDeleteMenu}
           onShowWaypoints={() => setShowWaypoints(true)}
@@ -1028,6 +1316,20 @@ export default function FlingApp() {
         />
       )}
 
+      {/* ── [STEP 4B] Node diagnostics ───────────────────────────────────── */}
+      {showNodeStats && (
+        <NodeStatsModal
+          deviceId={connectedDeviceId}
+          deviceName={connectedDeviceName}
+          frequencyHz={RADIO_FREQUENCY_HZ}
+          spreadingFactor={RADIO_SPREADING_FACTOR}
+          bandwidthHz={RADIO_BANDWIDTH_HZ}
+          battery={connectedDeviceBattery}
+          stats={nodeStats}
+          onClose={() => setShowNodeStats(false)}
+        />
+      )}
+
       {/* ── Waypoints ────────────────────────────────────────────────────── */}
       {showWaypoints && (
         <WaypointModal
@@ -1073,6 +1375,17 @@ export default function FlingApp() {
                   <p className="text-gray-300">Sending request to {currentContact?.deviceName}…</p>
                 </>
               )}
+              {/* [STEP 6] Timeout / connection-loss while waiting now ends in a
+                  clear error state instead of spinning or hanging forever. */}
+              {locationRequestStatus === "error" && (
+                <>
+                  <div className="w-32 h-32 mx-auto bg-red-600/20 rounded-full flex items-center justify-center mb-6">
+                    <X className="h-16 w-16 text-red-400" />
+                  </div>
+                  <h3 className="text-xl font-semibold text-white mb-3">No Response</h3>
+                  <p className="text-gray-300">Tap the X above to close, then try again.</p>
+                </>
+              )}
               {locationDebugMessage && (
                 <p className="mt-6 text-xs text-yellow-500 animate-pulse">{locationDebugMessage}</p>
               )}
@@ -1109,7 +1422,9 @@ export default function FlingApp() {
               ) : (
                 <>
                   <p className="text-gray-400 text-xs mb-6 px-4">
-                    Your location will be shared every {LIVE_LOCATION_INTERVAL_MS / 1000}s until you stop.
+                    Your location updates automatically as you move, or at
+                    least every {LIVE_SHARE_HEARTBEAT_MS / 1000}s while
+                    stationary, until you stop.
                   </p>
                   {locationDebugMessage && (
                     <p className="text-xs text-yellow-500 mb-4 animate-pulse">{locationDebugMessage}</p>

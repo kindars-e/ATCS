@@ -1,5 +1,6 @@
 import {
   Activity,
+  BatteryMedium,
   Navigation,
   Radio,
   RefreshCw,
@@ -19,6 +20,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { ConnectionStatus } from "@/components/connection-status";
 import { FlingLogo } from "@/components/fling-logo";
 import { SignalIndicator } from "@/components/signal-indicator";
+import { RADIO_FREQUENCY_HZ } from "@/lib/constants";
 import type { Contact, ConnectionState } from "@/lib/types";
 
 interface PwaInstallHandle {
@@ -34,6 +36,12 @@ interface ContactsViewProps {
   connectionState: ConnectionState;
   reconnectAttempts: number;
   lastConnectionError: string | null;
+  // [STEP 4B] Our own connected node's battery + a way to open the full
+  // diagnostics panel — replaces the previous hardcoded "915MHz / 12km"
+  // placeholder, which didn't match the firmware's actual 433MHz radio and
+  // was an unverified range claim.
+  connectedDeviceBattery?: number;
+  onShowNodeStats: () => void;
   showDeleteMenu: string | null;
   onToggleDeleteMenu: (deviceId: string | null) => void;
   onShowWaypoints: () => void;
@@ -50,6 +58,8 @@ export function ContactsView({
   connectionState,
   reconnectAttempts,
   lastConnectionError,
+  connectedDeviceBattery,
+  onShowNodeStats,
   showDeleteMenu,
   onToggleDeleteMenu,
   onShowWaypoints,
@@ -114,16 +124,27 @@ export function ContactsView({
                 reconnectAttempts={reconnectAttempts}
                 onReconnect={onReconnect}
               />
-              <div className="flex items-center gap-3 text-sm">
+              {/* [STEP 4B] Real radio frequency + battery, tap to open full
+                  node diagnostics. Previously hardcoded "915MHz / 12km" —
+                  wrong frequency (firmware runs 433MHz) and an unverified
+                  range claim; both misled users about what they were
+                  actually getting. */}
+              <button
+                onClick={onShowNodeStats}
+                className="flex items-center gap-3 text-sm hover:opacity-80 transition-opacity"
+              >
                 <div className="flex items-center gap-1">
                   <Signal className="h-3.5 w-3.5 text-blue-500" />
-                  <span className="text-gray-400">915MHz</span>
+                  <span className="text-gray-400">{RADIO_FREQUENCY_HZ / 1_000_000}MHz</span>
                 </div>
                 <div className="flex items-center gap-1">
-                  <Activity className="h-3.5 w-3.5 text-blue-500" />
-                  <span className="text-gray-400">12km</span>
+                  <BatteryMedium className="h-3.5 w-3.5 text-blue-500" />
+                  <span className="text-gray-400">
+                    {connectedDeviceBattery !== undefined ? `${connectedDeviceBattery}%` : "—"}
+                  </span>
                 </div>
-              </div>
+                <Activity className="h-3.5 w-3.5 text-gray-500" />
+              </button>
             </div>
           </div>
         </div>
@@ -250,6 +271,13 @@ export function ContactsView({
                             signalSampledAt={contact.signalSampledAt}
                             signalHopDistance={contact.signalHopDistance}
                           />
+                          {/* [STEP 4B] Battery, when we've ever heard one for this node. */}
+                          {contact.battery !== undefined && (
+                            <span className="inline-flex items-center gap-1 ml-2 text-xs text-gray-500">
+                              <BatteryMedium className="h-3 w-3" />
+                              {contact.battery}%
+                            </span>
+                          )}
                         </div>
                       )}
                       {contact.deviceId !== "*" && (

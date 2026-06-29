@@ -34,6 +34,15 @@ interface UseGeolocationResult {
   requestPermission: () => Promise<void>;
 }
 
+// [STEP 6] This product's whole premise is operating with ZERO internet —
+// the Ranger node's Wi-Fi hotspot has none by design. The IP-geolocation
+// fallback below makes a real `fetch()` to a public internet API, which
+// will simply hang for its full timeout and fail every time in the field.
+// It's only ever actually useful on a developer's machine that has a normal
+// internet connection (e.g. testing in a browser via `npm run dev` without
+// a GPS chip) — so it must be explicitly opted into, never the default.
+const ALLOW_IP_FALLBACK_BY_DEFAULT = false;
+
 function toError(code: number, permErr: GeolocationPositionError): string {
   switch (code) {
     case permErr.PERMISSION_DENIED:
@@ -102,7 +111,10 @@ function smoothPosition(
   return buildSyntheticPosition(lat, lng);
 }
 
-export default function useGeolocation(): UseGeolocationResult {
+export default function useGeolocation(
+  opts: { allowIpFallback?: boolean } = {},
+): UseGeolocationResult {
+  const allowIpFallback = opts.allowIpFallback ?? ALLOW_IP_FALLBACK_BY_DEFAULT;
   const [position, setPosition] = useState<GeolocationPosition | null>(null);
   const [permission, setPermission] = useState<Permission>("prompt");
   const [error, setError] = useState<string | null>(null);
@@ -125,14 +137,18 @@ export default function useGeolocation(): UseGeolocationResult {
 
   const requestPermission = async () => {
     if (!navigator.geolocation) {
-      // No GPS support — try IP geolocation as a fallback.
-      const ipPos = await getIpLocation();
+      // [STEP 6] No GPS support — only attempt the internet-dependent IP
+      // fallback if explicitly opted in (see ALLOW_IP_FALLBACK_BY_DEFAULT).
+      // In the field there is never internet access, so this would
+      // otherwise just be a guaranteed-to-fail network call on every device
+      // without a GPS chip.
+      const ipPos = allowIpFallback ? await getIpLocation() : null;
       if (ipPos) {
         setPosition(ipPos);
         setPermission("granted");
         setUsingFallback(true);
       } else {
-        setError("Geolocation is not supported by your browser");
+        setError("Geolocation is not supported by this device");
       }
       return;
     }
@@ -196,15 +212,16 @@ export default function useGeolocation(): UseGeolocationResult {
 
       watchIdRef.current = id;
     } catch {
-      // GPS failed or was denied — fall back to IP geolocation.
-      const ipPos = await getIpLocation();
+      // [STEP 6] GPS failed or was denied — only fall back to the
+      // internet-dependent IP lookup if explicitly opted in.
+      const ipPos = allowIpFallback ? await getIpLocation() : null;
       if (ipPos) {
         setPosition(ipPos);
         setPermission("granted");
         setUsingFallback(true);
         setError(null);
       } else {
-        setError("Unable to determine location. Please allow location access or check your connection.");
+        setError("Unable to determine location. Please check that location services are enabled.");
       }
     }
   };

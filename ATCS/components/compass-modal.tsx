@@ -45,6 +45,7 @@ import { Button }              from "@/components/ui/button";
 import useGeolocation          from "@/hooks/use-geolocation";
 import useDeviceOrientation    from "@/hooks/use-device-orientation";
 import { calculateBearing, calculateDistance } from "@/lib/geo";
+import { LOCATION_STALE_MS, LOCATION_LOST_MS } from "@/lib/constants";
 import type { Contact }        from "@/lib/types";
 
 interface CompassModalProps {
@@ -53,12 +54,31 @@ interface CompassModalProps {
   onClose: () => void;
 }
 
+// [STEP 6] "3s ago" / "4m ago" — short, no decimals, used for the staleness
+// readout below.
+function formatAge(ms: number): string {
+  if (ms < 1000) return "just now";
+  if (ms < 60_000) return `${Math.round(ms / 1000)}s ago`;
+  return `${Math.round(ms / 60_000)}m ago`;
+}
+
 export function CompassModal({ contact, onBeep, onClose }: CompassModalProps) {
   const {
     position: userPosition,
     requestPermission: requestGeoPermission,
     usingFallback,
   } = useGeolocation();
+
+  // [STEP 6] Automatic handling of stale location data: targetLocation only
+  // changes when a fresh location-response/location-broadcast arrives, so
+  // without a ticking clock the "X ago" readout below would freeze the
+  // instant updates stop arriving instead of counting up — exactly the
+  // "looks live forever" bug identified in the location-system review.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
 
   const {
     permission: compassPermission,
@@ -81,6 +101,12 @@ export function CompassModal({ contact, onBeep, onClose }: CompassModalProps) {
 
   // PC-mode: no compass sensor available — show static bearing arrow.
   const isPcMode = !hasDeviceOrientationSupport;
+
+  // [STEP 6] Automatic stale-location handling. Waypoints are a user's own
+  // saved fix, not a live share, so staleness doesn't apply to them.
+  const locationAgeMs = targetLocation ? now - new Date(targetLocation.timestamp).getTime() : null;
+  const isStale = !isWaypoint && locationAgeMs !== null && locationAgeMs > LOCATION_STALE_MS;
+  const isLost  = !isWaypoint && locationAgeMs !== null && locationAgeMs > LOCATION_LOST_MS;
 
   // ── [FIX 2] Compute distance independently of compass ──────────────────────
   // The original code put distance inside the bearing effect, meaning distance
@@ -352,6 +378,17 @@ export function CompassModal({ contact, onBeep, onClose }: CompassModalProps) {
             {distanceInMeters > 0 && (
               <p className="text-xs text-gray-500 mt-1">{distanceInMeters} m away</p>
             )}
+            {/* [STEP 6] Automatic stale-location handling — never present an
+                old fix as if it were live. */}
+            {locationAgeMs !== null && !isWaypoint && (
+              <p className={`text-xs mt-1 ${isLost ? "text-red-400" : isStale ? "text-yellow-500" : "text-gray-500"}`}>
+                {isLost
+                  ? `⚠ Last seen ${formatAge(locationAgeMs)} — may no longer be accurate`
+                  : isStale
+                  ? `Last updated ${formatAge(locationAgeMs)}`
+                  : `Updated ${formatAge(locationAgeMs)}`}
+              </p>
+            )}
           </div>
 
           {/* Debug info */}
@@ -423,6 +460,16 @@ export function CompassModal({ contact, onBeep, onClose }: CompassModalProps) {
             <span className="text-3xl opacity-75 ml-1">{distanceTexts.unit}</span>
           </div>
           <p className="text-3xl font-medium mt-1">{distanceTexts.direction}</p>
+          {/* [STEP 6] Automatic stale-location handling. */}
+          {locationAgeMs !== null && !isWaypoint && (
+            <p className={`text-xs mt-1 ${isLost ? "text-red-400" : isStale ? "text-yellow-500" : "text-gray-500"}`}>
+              {isLost
+                ? `⚠ Last seen ${formatAge(locationAgeMs)} — may no longer be accurate`
+                : isStale
+                ? `Last updated ${formatAge(locationAgeMs)}`
+                : `Updated ${formatAge(locationAgeMs)}`}
+            </p>
+          )}
           <div className="mt-4 text-xs text-gray-500 text-center">
             {!userPosition && <p>Getting GPS location…</p>}
             {!direction && userPosition && <p>Accessing compass…</p>}

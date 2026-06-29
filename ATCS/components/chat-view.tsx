@@ -274,6 +274,11 @@ export function ChatView({
                           {message.status === "read" && (
                             <CheckCheck className="w-4 h-4 text-blue-300" />
                           )}
+                          {/* [STEP 4B] Previously "failed" only showed via the red
+                              bubble background — no tick icon at all, easy to miss. */}
+                          {message.status === "failed" && (
+                            <X className="w-4 h-4" />
+                          )}
                           {message.offline && <WifiOff className="w-3 h-3 ml-1" />}
                         </div>
                       )}

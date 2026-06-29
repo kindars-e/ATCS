@@ -49,7 +49,7 @@ import {
   RECONNECT_MAX_DELAY_MS,
 } from "@/lib/constants";
 import { decodeMessage, type OutgoingFrame } from "@/lib/protocol";
-import type { ConnectionState } from "@/lib/types";
+import type { ConnectionState, NodeStats } from "@/lib/types";
 
 // ── Events the hook can emit to the rest of the app ──────────────────────────
 export type RangerEvent =
@@ -57,16 +57,28 @@ export type RangerEvent =
   // (an emergency message). The app routes broadcasts into the Emergency thread.
   | { kind: "text";               sender: string; content: string; broadcast: boolean; rssi?: number; snr?: number }
   | { kind: "location-request";   sender: string }
-  | { kind: "location-response";  sender: string; lat: number; lng: number; accuracy: number }
-  | { kind: "location-broadcast"; sender: string; lat: number; lng: number; accuracy: number }
+  // [STEP 6] broadcast: true when this arrived via the automatic SOS
+  // location ping rather than a normal 1:1 share/live-share update.
+  | { kind: "location-response";  sender: string; lat: number; lng: number; accuracy: number; broadcast: boolean }
+  // [STEP 6] Live-share session explicitly ended by the responder.
+  | { kind: "location-stop";      sender: string }
   | { kind: "frequency-update";   frequency: number }
   | { kind: "delivery-confirmed" }
+  // [STEP 4B] Unicast delivery permanently failed (retries + the one
+  // rediscovery cycle from Step 4A both exhausted). dest identifies which
+  // contact's most recent send failed, if the firmware included it.
+  | { kind: "delivery-failed";    dest?: string }
+  // [STEP 4B] One node confirmed it received our SOS broadcast. May fire
+  // multiple times (once per node that received it) for a single SOS send.
+  | { kind: "sos-delivered";      from: string }
   // [STEP 4A] hops: how many mesh hops away the discovered node is. Used to
   // tag the RSSI reading as direct (0) vs relayed (>0) — see signalHopDistance.
-  | { kind: "node-discovered";    deviceId: string; rssi?: number; snr?: number; hops?: number }
+  // [STEP 4B] battery: the discovered node's battery level, if it sent one.
+  | { kind: "node-discovered";    deviceId: string; rssi?: number; snr?: number; hops?: number; battery?: number }
   // [STEP 4A] Relayed RSSI/SNR from a direct neighbor's HELLO beacon — no new
   // LoRa traffic, just the firmware forwarding a reading it already had.
-  | { kind: "neighbor-heard";     deviceId: string; rssi?: number; snr?: number }
+  // [STEP 4B] battery: that neighbor's battery level (same HELLO beacon).
+  | { kind: "neighbor-heard";     deviceId: string; rssi?: number; snr?: number; battery?: number }
   // [NEW] Another node sent us a ##PAIR_REQ## over LoRa.
   | { kind: "pair-request";       sender: string; senderName: string }
   // [NEW] A node we paired with replied with ##PAIR_ACK## — add them to contacts.
@@ -78,14 +90,21 @@ interface UseRangerConnectionOptions {
 }
 
 interface UseRangerConnectionResult {
-  connectionState:     ConnectionState;
-  isOnline:            boolean;
-  connectedDeviceId:   string;
-  connectedDeviceName: string;   // [NEW] firmware's WIFI_SSID (our display name)
-  lastConnectionError: string;
-  reconnectAttempts:   number;
-  send:                (frame: OutgoingFrame) => boolean;
-  reconnect:           () => void;
+  connectionState:        ConnectionState;
+  isOnline:               boolean;
+  connectedDeviceId:      string;
+  connectedDeviceName:    string;   // [NEW] firmware's WIFI_SSID (our display name)
+  // [STEP 4B] Our own connected node's battery level (from device_info /
+  // periodic stats). Undefined until the first frame carrying it arrives.
+  connectedDeviceBattery: number | undefined;
+  // [STEP 4B] Periodic firmware health/diagnostics counters. Null until the
+  // first "stats" frame arrives (firmware only sends it while a phone is
+  // connected, every 5s).
+  nodeStats:              NodeStats | null;
+  lastConnectionError:    string;
+  reconnectAttempts:      number;
+  send:                   (frame: OutgoingFrame) => boolean;
+  reconnect:              () => void;
 }
 
 export function useRangerConnection({
@@ -100,6 +119,9 @@ export function useRangerConnection({
   // [NEW] Store the firmware's display name (WIFI_SSID) so we can include it
   // in outgoing pair requests so the recipient knows what to call us.
   const [connectedDeviceName, setConnectedDeviceName] = useState("");
+  // [STEP 4B] See UseRangerConnectionResult above.
+  const [connectedDeviceBattery, setConnectedDeviceBattery] = useState<number | undefined>(undefined);
+  const [nodeStats,           setNodeStats]           = useState<NodeStats | null>(null);
   const [reconnectAttempts,   setReconnectAttempts]   = useState(0);
 
   const wsRef               = useRef<WebSocket | null>(null);
@@ -286,12 +308,16 @@ export function useRangerConnection({
 
           } else if (decoded.kind === "location-response") {
             emit({
-              kind:     "location-response",
-              sender:   decoded.sender,
-              lat:      decoded.lat,
-              lng:      decoded.lng,
-              accuracy: decoded.accuracy,
+              kind:      "location-response",
+              sender:    decoded.sender,
+              lat:       decoded.lat,
+              lng:       decoded.lng,
+              accuracy:  decoded.accuracy,
+              broadcast: decoded.broadcast, // [STEP 6]
             });
+
+          } else if (decoded.kind === "location-stop") {
+            emit({ kind: "location-stop", sender: decoded.sender }); // [STEP 6]
 
           // [NEW] Another node sent us ##PAIR_REQ## — forward to fling-app so
           // it can automatically accept and add the sender as a contact.
@@ -313,21 +339,12 @@ export function useRangerConnection({
           break;
         }
 
-        case "location": {
-          emit({
-            kind:     "location-broadcast",
-            sender:   (frame.sender   as string) ?? "unknown",
-            lat:      frame.lat       as number,
-            lng:      frame.lng       as number,
-            accuracy: (frame.accuracy as number | undefined) ?? 10,
-          });
-          break;
-        }
-
         case "device_info": {
           setConnectedDeviceId(frame.deviceId as string);
           // [NEW] Store the device name (WIFI_SSID) for use in pair requests.
           setConnectedDeviceName((frame.deviceName as string) ?? "");
+          // [STEP 4B] Our own node's battery level, if the firmware sent one.
+          setConnectedDeviceBattery(frame.battery as number | undefined);
           const freq = frame.frequency as number | undefined;
           if (freq && freq !== 433_000_000) {
             emit({ kind: "frequency-update", frequency: freq });
@@ -335,9 +352,39 @@ export function useRangerConnection({
           break;
         }
 
+        // [STEP 4B] Periodic firmware health/diagnostics counters.
+        case "stats": {
+          setNodeStats({
+            messagesSent:        (frame.messagesSent        as number) ?? 0,
+            messagesReceived:    (frame.messagesReceived    as number) ?? 0,
+            uptime:              (frame.uptime              as number) ?? 0,
+            connectedClients:    (frame.connectedClients    as number) ?? 0,
+            pktForwarded:        (frame.pktForwarded         as number) ?? 0,
+            pktDroppedDup:       (frame.pktDroppedDup        as number) ?? 0,
+            pktDroppedNoRoute:   (frame.pktDroppedNoRoute    as number) ?? 0,
+            pktDroppedQueueFull: (frame.pktDroppedQueueFull  as number) ?? 0,
+            routeDiscoveries:    (frame.routeDiscoveries     as number) ?? 0,
+            battery:             frame.battery as number | undefined,
+          });
+          // [STEP 4B] The periodic stats frame also carries our own battery —
+          // keep it fresh even between device_info/connect events.
+          if (frame.battery !== undefined) {
+            setConnectedDeviceBattery(frame.battery as number);
+          }
+          break;
+        }
+
+        // [STEP 4A/4B] status: "delivered" (unicast ACK), "failed" (Step 4A
+        // retries + rediscovery exhausted), or "sos_received" (Step 4B — one
+        // node confirmed receipt of our SOS broadcast; may fire repeatedly).
         case "delivery": {
-          if ((frame.status as string) === "delivered") {
+          const status = frame.status as string;
+          if (status === "delivered") {
             emit({ kind: "delivery-confirmed" });
+          } else if (status === "failed") {
+            emit({ kind: "delivery-failed", dest: frame.dest as string | undefined });
+          } else if (status === "sos_received") {
+            emit({ kind: "sos-delivered", from: (frame.from as string) ?? "" });
           }
           break;
         }
@@ -349,6 +396,7 @@ export function useRangerConnection({
             rssi:     frame.rssi as number | undefined,
             snr:      frame.snr  as number | undefined,   // [v6] forward SNR
             hops:     frame.hops as number | undefined,    // [STEP 4A]
+            battery:  frame.battery as number | undefined, // [STEP 4B]
           });
           break;
         }
@@ -358,6 +406,7 @@ export function useRangerConnection({
           emit({
             kind:     "neighbor-heard",
             deviceId: (frame.deviceId as string) ?? "",
+            battery:  frame.battery as number | undefined, // [STEP 4B]
             rssi:     frame.rssi as number | undefined,
             snr:      frame.snr  as number | undefined,
           });
@@ -526,6 +575,8 @@ export function useRangerConnection({
     isOnline,
     connectedDeviceId,
     connectedDeviceName,
+    connectedDeviceBattery,
+    nodeStats,
     lastConnectionError,
     reconnectAttempts,
     send,

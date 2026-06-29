@@ -25,6 +25,28 @@ export type Contact = {
   signalSampledAt?: Date;     // when rssi/snr was actually measured
   signalHopDistance?: number; // 0 = direct neighbor (HELLO-relay), >0 = relayed/multi-hop
   location?: ContactLocation;
+  // [STEP 4B] Battery percentage reported by the node itself, via a relayed
+  // HELLO beacon (direct neighbor) or a discovery reply (possibly multi-hop).
+  // Undefined until we've heard it at least once. On current dev hardware
+  // this is always 100 (no fuel gauge wired) — see readBatteryPercent() in
+  // the firmware — but the telemetry path itself is complete end to end.
+  battery?: number;
+};
+
+// [STEP 4B] Periodic firmware health/diagnostics counters, surfaced as-is
+// from the firmware's "stats" WS frame (sent every 5s while a phone is
+// connected). Purely informational — nothing in the app logic depends on it.
+export type NodeStats = {
+  messagesSent: number;
+  messagesReceived: number;
+  uptime: number; // seconds since the node booted
+  connectedClients: number;
+  pktForwarded: number;
+  pktDroppedDup: number;
+  pktDroppedNoRoute: number;
+  pktDroppedQueueFull: number;
+  routeDiscoveries: number;
+  battery?: number; // this node's own battery level
 };
 
 // [STEP 4A] Time-only reachability. Never influenced by signal strength.

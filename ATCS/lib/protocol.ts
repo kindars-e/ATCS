@@ -17,19 +17,39 @@
 //                 flag to route the message into the shared Emergency thread
 //                 instead of the sender's private chat.
 //   location    – location broadcast received via LoRa
-//   device_info – sent once when WebSocket connects
-//   stats       – periodic health counters (ignored by app)
-//   delivery    – ACK: remote node confirmed it received our message
-//   discovery   – a nearby node replied to our discovery ping
+//   device_info – sent once when WebSocket connects. [STEP 4B] now includes
+//                 our own node's battery level.
+//   stats       – [STEP 4B] periodic health/diagnostics counters, now
+//                 surfaced in the app (see NodeStats in lib/types.ts).
+//   delivery    – status: "delivered" (unicast ACK), "failed" (retries +
+//                 rediscovery exhausted — STEP 4A), or "sos_received"
+//                 ([STEP 4B] one node confirmed receipt of our SOS broadcast;
+//                 may arrive multiple times, once per node that received it).
+//   discovery   – a nearby node replied to our discovery ping. [STEP 4B] may
+//                 include that node's battery level.
 //   neighbor    – [STEP 4A] relayed RSSI/SNR from a direct neighbor's HELLO
 //                 beacon. Reuses traffic that was already happening every
 //                 HELLO_INTERVAL_MS — no new LoRa packets are sent for this.
+//                 [STEP 4B] now also includes that neighbor's battery level.
 //
 // LoRa DATA SENTINELS (embedded in message.data field):
-//   ##LOCATION_REQUEST##                  – requester asks for responder's GPS
-//   ##LOCATION_RESPONSE##lat,lng,acc      – responder sends their GPS back
-//   ##PAIR_REQ##senderName                – [NEW] node A asks to pair with node B
-//   ##PAIR_ACK##senderName                – [NEW] node B accepts pairing
+//   ##LREQ##                  – [STEP 6] requester asks for responder's GPS
+//   ##LRESP##lat,lng,acc      – [STEP 6] responder sends a GPS fix back (used
+//                               for both one-time responses and each live-share
+//                               update — same format either way)
+//   ##LSTOP##                 – [STEP 6] responder explicitly ended a live
+//                               share session, so the requester can show
+//                               "stopped sharing" instead of silently going stale
+//   ##PAIR_REQ##senderName    – [NEW] node A asks to pair with node B
+//   ##PAIR_ACK##senderName    – [NEW] node B accepts pairing
+//
+// [STEP 6] These sentinels are entirely an app-level convention — the
+// firmware never inspects message content, just relays bytes — so shortening
+// them (from ##LOCATION_REQUEST##/##LOCATION_RESPONSE##) is a pure airtime
+// saving with no firmware change required. An app still running the old,
+// longer sentinels simply won't recognise the new short ones and will show
+// them as literal chat text instead of decoding them — a visible but
+// non-crashing degradation, not a protocol break.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import {
@@ -37,9 +57,11 @@ import {
   PAIR_ACCEPT_SENTINEL,
 } from "./constants";
 
-// Sentinel strings for location sharing (must match firmware #defines).
-const LOCATION_REQUEST_SENTINEL  = "##LOCATION_REQUEST##";
-const LOCATION_RESPONSE_SENTINEL = "##LOCATION_RESPONSE##";
+// Sentinel strings for location sharing (app-level convention only — the
+// firmware treats these as opaque text, identical to any chat message).
+const LOCATION_REQUEST_SENTINEL  = "##LREQ##";
+const LOCATION_RESPONSE_SENTINEL = "##LRESP##";
+const LOCATION_STOP_SENTINEL     = "##LSTOP##";
 
 // ── Outgoing frame union ──────────────────────────────────────────────────────
 export type OutgoingFrame =
@@ -50,16 +72,24 @@ export type OutgoingFrame =
   | { type: "ping" };
 
 // ── Incoming frame union ──────────────────────────────────────────────────────
+// [STEP 6] Removed the unused `"location"` frame type — the firmware never
+// actually sends a frame of that type (confirmed by full-text search of the
+// firmware source); every location update arrives as an ordinary `"message"`
+// frame whose `data` field decodes to a location-* DecodedMessage below. The
+// `"location"`/`location-broadcast` handling that referenced it elsewhere was
+// dead code and has been removed too.
 export type IncomingFrame =
   // [NEW] broadcast?: true when this message arrived as a LoRa "*" broadcast.
   | { type: "message";     sender: string; data: string; rssi?: number; broadcast?: boolean }
-  | { type: "location";    sender: string; lat: number; lng: number; accuracy?: number }
   | { type: "device_info"; deviceId: string; deviceName: string; frequency?: number;
-                           spreadingFactor?: number; bandwidth?: number }
-  | { type: "stats";       [key: string]: unknown }
-  | { type: "delivery";    status: "delivered" }
-  | { type: "discovery";   deviceId: string; rssi?: number }
-  | { type: "neighbor";    deviceId: string; rssi?: number; snr?: number };
+                           spreadingFactor?: number; bandwidth?: number; battery?: number }
+  | { type: "stats";       messagesSent: number; messagesReceived: number; uptime: number;
+                           connectedClients: number; pktForwarded: number; pktDroppedDup: number;
+                           pktDroppedNoRoute: number; pktDroppedQueueFull: number;
+                           routeDiscoveries: number; battery?: number }
+  | { type: "delivery";    status: "delivered" | "failed" | "sos_received"; dest?: string; from?: string }
+  | { type: "discovery";   deviceId: string; rssi?: number; hops?: number; battery?: number }
+  | { type: "neighbor";    deviceId: string; rssi?: number; snr?: number; battery?: number };
 
 // ── Decoded message types ─────────────────────────────────────────────────────
 export type DecodedMessage =
@@ -67,7 +97,11 @@ export type DecodedMessage =
   // emergency broadcasts into the shared Emergency thread.
   | { kind: "text";              sender: string; content: string; broadcast: boolean }
   | { kind: "location-request";  sender: string }
-  | { kind: "location-response"; sender: string; lat: number; lng: number; accuracy: number }
+  // [STEP 6] broadcast: true when this fix arrived via the automatic
+  // SOS location ping ("*" recipient) rather than a normal 1:1 share.
+  | { kind: "location-response"; sender: string; lat: number; lng: number; accuracy: number; broadcast: boolean }
+  // [STEP 6] The responder explicitly ended a live-share session.
+  | { kind: "location-stop";     sender: string }
   // [NEW] Pairing handshake messages decoded from raw LoRa data fields.
   | { kind: "pair-request";      sender: string; senderName: string }
   | { kind: "pair-accept";       sender: string; senderName: string };
@@ -97,12 +131,18 @@ export function decodeMessage(frame: {
       .slice(LOCATION_RESPONSE_SENTINEL.length)
       .split(",");
     return {
-      kind:     "location-response",
+      kind:      "location-response",
       sender,
-      lat:      Number(latStr),
-      lng:      Number(lngStr),
-      accuracy: Number(accStr) || 10,
+      lat:       Number(latStr),
+      lng:       Number(lngStr),
+      accuracy:  Number(accStr) || 10,
+      broadcast,
     };
+  }
+
+  // [STEP 6] Live-share session explicitly ended: "##LSTOP##"
+  if (data === LOCATION_STOP_SENTINEL) {
+    return { kind: "location-stop", sender };
   }
 
   // [NEW] Pair request: "##PAIR_REQ##Fling_Node1"
@@ -136,6 +176,11 @@ export function encodeLocationRequest(recipient: string): OutgoingFrame {
   return { type: "send", recipient, data: LOCATION_REQUEST_SENTINEL };
 }
 
+// [STEP 6] lat/lng rounded to 6 decimal places (~11cm precision — finer than
+// consumer GPS accuracy ever is) and accuracy rounded to the nearest metre.
+// A raw JS float can print 15+ significant digits; bounding the precision
+// keeps every location packet a predictable, minimal size on an already
+// bandwidth-constrained LoRa link.
 export function encodeLocationResponse(
   recipient: string,
   lat:      number,
@@ -145,8 +190,15 @@ export function encodeLocationResponse(
   return {
     type: "send",
     recipient,
-    data: `${LOCATION_RESPONSE_SENTINEL}${lat},${lng},${accuracy}`,
+    data: `${LOCATION_RESPONSE_SENTINEL}${lat.toFixed(6)},${lng.toFixed(6)},${Math.round(accuracy)}`,
   };
+}
+
+// [STEP 6] Tells the requester this live-share session has explicitly ended,
+// so they can show "stopped sharing" instead of the location silently going
+// stale with no explanation.
+export function encodeLocationStop(recipient: string): OutgoingFrame {
+  return { type: "send", recipient, data: LOCATION_STOP_SENTINEL };
 }
 
 export function encodeBeep(recipient: string): OutgoingFrame {

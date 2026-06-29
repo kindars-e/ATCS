@@ -144,8 +144,8 @@
 // be different on every physical node and MUST be 8 characters or
 // fewer (NODE_ID_LEN below) so it fits the fixed-size header field.
 // ════════════════════════════════════════════════════════════════════════
-#define THIS_DEVICE_ID  "Node1"          // ← Change per node (max 8 chars)
-#define WIFI_SSID       "ATCS_Node1"    // ← Must match THIS_DEVICE_ID suffix
+#define THIS_DEVICE_ID  "Node4"          // ← Change per node (max 8 chars)
+#define WIFI_SSID       "ATCS_Node4"    // ← Must match THIS_DEVICE_ID suffix
 #define WIFI_PASS       "atcs1234"
 
 // ════════════════════════════════════════════════════════════════════════
@@ -174,6 +174,12 @@
 #define PKT_RREP             5
 #define PKT_DISCOVER         6
 #define PKT_DISCOVER_REPLY   7
+// [STEP 4B] Lightweight SOS delivery confirmation — one small unicast control
+// packet per node that actually received an emergency broadcast, routed back
+// using the reverse path learned from the broadcast itself (same technique
+// RREQ already uses). NOT an ack-of-everyone-at-once flood: each node sends
+// exactly one of these, best-effort, with no retry of its own.
+#define PKT_SOS_ACK          8
 
 // ── Priorities (higher number = sent first) ─────────────────────────────
 #define PRIO_NORMAL    0   // ordinary chat
@@ -192,7 +198,13 @@
 #define HELLO_INTERVAL_MS     15000   // how often we announce ourselves
 #define NEIGHBOR_EXPIRY_MS     45000   // forget a neighbour after this long
 #define ROUTE_EXPIRY_MS         60000   // forget an unused route after this long
-#define ROUTE_DISCOVERY_TIMEOUT_MS  4000   // give up waiting for a route reply
+// [STEP 4B] Route discovery robustness: ROUTE_DISCOVERY_TIMEOUT_MS is now the
+// TOTAL budget across up to MAX_RREQ_ATTEMPTS tries, not a single attempt.
+// A lone lost RREQ broadcast on a lossy RF link no longer means an instant
+// "no route" failure — one controlled retry happens first.
+#define ROUTE_DISCOVERY_TIMEOUT_MS  6000   // total budget across all RREQ attempts
+#define MAX_RREQ_ATTEMPTS              2     // 1 initial + 1 controlled retry (bounded — never loops)
+#define RREQ_RETRY_INTERVAL_MS      3000   // resend once if no RREP within this long
 #define ACK_TIMEOUT_MS           1500   // how long to wait for an end-to-end ACK
 #define MAX_SEND_RETRIES            3     // unicast resend attempts before giving up
 #define SEEN_CACHE_EXPIRY_MS    30000   // forget old dedup entries
@@ -422,6 +434,9 @@ struct PendingRouteItem {
   // this rediscovery, so the resend it eventually flushes into is correctly
   // marked as a recovery attempt too (see PendingAckItem.isRecoveryAttempt).
   bool          isRecoveryAttempt;
+  // [STEP 4B] Controlled RREQ retry bookkeeping — bounded by MAX_RREQ_ATTEMPTS.
+  uint8_t       attemptsLeft;
+  unsigned long nextRetryAt;
 };
 PendingRouteItem pendingRoutes[MAX_PENDING_ROUTE];
 
@@ -546,6 +561,10 @@ unsigned int  pktForwarded       = 0;
 unsigned int  pktDroppedDup      = 0;
 unsigned int  pktDroppedNoRoute  = 0;
 unsigned int  routeDiscoveries   = 0;
+// [STEP 4B] Counts packets dropped (or the queue's lowest-priority item
+// evicted) because the outgoing queue was full — visibility into congestion
+// without resizing MAX_OUTQUEUE.
+unsigned int  pktDroppedQueueFull = 0;
 unsigned long lastMsgTime        = 0;
 
 bool lastSosState  = HIGH;
@@ -697,7 +716,25 @@ bool enqueueRaw(const uint8_t* buf, uint8_t len, uint8_t priority, bool isFlood)
   for (int i = 0; i < MAX_OUTQUEUE; i++) {
     if (!outQueue[i].inUse) { freeSlot = i; break; }
   }
-  if (freeSlot < 0) return false; // queue full — congestion; drop and let retry/backoff handle it
+
+  if (freeSlot < 0) {
+    // [STEP 4B] Queue overflow detection + handling. Rather than always
+    // dropping the NEW packet (which could let a backlog of normal chat
+    // starve an SOS/control packet trying to get in), preempt the single
+    // lowest-priority queued item if this new packet outranks it. Still
+    // strictly bounded by MAX_OUTQUEUE — no resizing, just smarter use of
+    // the fixed slots we already have.
+    int worst = 0;
+    for (int i = 1; i < MAX_OUTQUEUE; i++) {
+      if (outQueue[i].priority < outQueue[worst].priority) worst = i;
+    }
+    pktDroppedQueueFull++; // something is being dropped either way — count it
+    if (priority > outQueue[worst].priority) {
+      freeSlot = worst;
+    } else {
+      return false; // congested at this priority level — drop and let retry/backoff handle it
+    }
+  }
 
   unsigned long jitter = isFlood
     ? JITTER_FLOOD_MIN_MS   + random(JITTER_FLOOD_MAX_MS   - JITTER_FLOOD_MIN_MS)
@@ -922,6 +959,10 @@ void addPendingRoute(const char* dest, const uint8_t* buf, uint8_t len, bool isR
   pendingRoutes[freeSlot].len               = len;
   pendingRoutes[freeSlot].requestedAt       = millis();
   pendingRoutes[freeSlot].isRecoveryAttempt = isRecoveryAttempt;
+  // [STEP 4B] sendRREQ() below is attempt #1; reserve the remaining budget
+  // for one controlled retry from pendingRouteTick() if no RREP arrives.
+  pendingRoutes[freeSlot].attemptsLeft      = MAX_RREQ_ATTEMPTS - 1;
+  pendingRoutes[freeSlot].nextRetryAt       = millis() + RREQ_RETRY_INTERVAL_MS;
   sendRREQ(dest);
 }
 
@@ -942,6 +983,18 @@ void pendingRouteTick() {
       pendingRoutes[i].inUse = false;
       continue;
     }
+
+    // [STEP 4B] Controlled RREQ retry: if still no route and we haven't used
+    // up the retry budget, resend once before the overall timeout — a single
+    // lost RREQ broadcast on a lossy link shouldn't be a hard failure.
+    // Bounded by MAX_RREQ_ATTEMPTS; attemptsLeft reaches 0 and never resends
+    // again, so this can't loop.
+    if (pendingRoutes[i].attemptsLeft > 0 && now >= pendingRoutes[i].nextRetryAt) {
+      sendRREQ(pendingRoutes[i].dest);
+      pendingRoutes[i].attemptsLeft--;
+      pendingRoutes[i].nextRetryAt = now + RREQ_RETRY_INTERVAL_MS;
+    }
+
     if (now - pendingRoutes[i].requestedAt > ROUTE_DISCOVERY_TIMEOUT_MS) {
       reportDeliveryFailed(pendingRoutes[i].dest);
       pendingRoutes[i].inUse = false;
@@ -1015,6 +1068,19 @@ void sendAck(const char* dest, uint16_t msgId) {
   enqueuePacket(h, nullptr, false);
 }
 
+// [STEP 4B] Lightweight SOS delivery confirmation. Called by every node that
+// just received a fresh (non-duplicate) emergency broadcast. Sends exactly
+// ONE small unicast control packet back toward the originator, using the
+// reverse route that the caller already learned from the broadcast's own
+// header fields (no RREQ flood needed for this). Best-effort: if somehow no
+// route is available, forwardUnicast() just drops it silently — no retry,
+// no fallback to route discovery, so this can never turn into extra traffic.
+void sendSosAck(const char* dest, uint16_t msgId) {
+  MeshHeader h = makeHeader(PKT_SOS_ACK, dest, PRIO_CONTROL, 0);
+  h.msgId = msgId; // carries the ORIGINAL SOS message's id, like sendAck() does
+  forwardUnicast(h, nullptr);
+}
+
 void handleReceivedPacket(const uint8_t* buf, int len, int16_t rssi, float snr) {
   if (len < HEADER_SIZE) return; // too short to be a valid mesh packet
 
@@ -1062,6 +1128,9 @@ void handleReceivedPacket(const uint8_t* buf, int len, int16_t rssi, float snr) 
       doc["deviceId"] = h.src;
       doc["rssi"]     = rssi;
       doc["snr"]      = snr;
+      // [STEP 4B] HELLO's payload[0] is the battery byte we just read above
+      // (setNeighborBattery) — forward it too, still zero new LoRa traffic.
+      doc["battery"]  = payload[0];
       String out; serializeJson(doc, out);
       wsBroadcast(out);
       break; // TTL=1, never forwarded
@@ -1098,8 +1167,13 @@ void handleReceivedPacket(const uint8_t* buf, int len, int16_t rssi, float snr) 
       // for the requester, exactly like RREQ.
       addOrUpdateRoute(h.src, h.prevHop, h.hop);
 
-      MeshHeader reply = makeHeader(PKT_DISCOVER_REPLY, h.src, PRIO_CONTROL, 1);
-      uint8_t replyPayload[1] = { (uint8_t)(h.hop + 1) }; // hops from requester to us
+      // [STEP 4B] Piggyback our battery level on the SAME reply packet that
+      // was already being sent — no new LoRa traffic, just one extra byte.
+      MeshHeader reply = makeHeader(PKT_DISCOVER_REPLY, h.src, PRIO_CONTROL, 2);
+      uint8_t replyPayload[2] = {
+        (uint8_t)(h.hop + 1),    // hops from requester to us
+        readBatteryPercent(),    // our battery level
+      };
       forwardUnicast(reply, replyPayload);
 
       if (h.ttl > 0) forwardPacket(h, payload, true);
@@ -1114,6 +1188,10 @@ void handleReceivedPacket(const uint8_t* buf, int len, int16_t rssi, float snr) 
         doc["rssi"]     = rssi;
         doc["snr"]      = snr;
         doc["hops"]     = h.payloadLen > 0 ? payload[0] : h.hop; // additive field
+        // [STEP 4B] Only present when the replying node's firmware actually
+        // sent it (payloadLen > 1) — older replies just omit the field
+        // rather than the app reading a garbage byte.
+        if (h.payloadLen > 1) doc["battery"] = payload[1];
         String out; serializeJson(doc, out); wsBroadcast(out);
         if (connectedClients > 0 && !isScanning) setLedState(LED_NORMAL);
       } else {
@@ -1137,6 +1215,14 @@ void handleReceivedPacket(const uint8_t* buf, int len, int16_t rssi, float snr) 
       if (strstr(text, "SOS") != nullptr) triggerEmergencyBlink();
 
       if (broadcast) {
+        // [STEP 4B] Lightweight SOS delivery confirmation: learn a reverse
+        // route back to the originator from data this packet already
+        // carries (the same technique RREQ uses), then send ONE small
+        // unicast ack. Bounded by mesh size (one ack per node that actually
+        // received it) — never a flood, never retried by us.
+        addOrUpdateRoute(h.src, h.prevHop, h.hop);
+        sendSosAck(h.src, h.msgId);
+
         if (h.ttl > 0) forwardPacket(h, payload, true); // keep the flood going
       } else {
         sendAck(h.src, h.msgId);
@@ -1149,6 +1235,20 @@ void handleReceivedPacket(const uint8_t* buf, int len, int16_t rssi, float snr) 
         resolvePendingAck(h.src, h.msgId);
         triggerGreenConfirm();
         doc.clear(); doc["type"] = "delivery"; doc["status"] = "delivered";
+        String out; serializeJson(doc, out); wsBroadcast(out);
+      } else {
+        forwardUnicast(h, payload);
+      }
+      break;
+    }
+
+    // [STEP 4B] One node's confirmation that it received our SOS broadcast.
+    case PKT_SOS_ACK: {
+      if (strcmp(h.dst, THIS_DEVICE_ID) == 0) {
+        doc.clear();
+        doc["type"]   = "delivery";
+        doc["status"] = "sos_received";
+        doc["from"]   = h.src; // which node confirmed receipt
         String out; serializeJson(doc, out); wsBroadcast(out);
       } else {
         forwardUnicast(h, payload);
@@ -1283,6 +1383,12 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
       doc["frequency"]       = (long)LORA_FREQ;
       doc["spreadingFactor"] = LORA_SF;
       doc["bandwidth"]       = (long)LORA_BW;
+      // [STEP 4B] Complete the battery telemetry path: the firmware has
+      // always known its own level (readBatteryPercent()) but never told
+      // the phone. Currently a fixed-100 stub on dev boards with no fuel
+      // gauge wired — the plumbing is complete and ready for when real ADC
+      // code is added (see readBatteryPercent()'s comment).
+      doc["battery"]         = readBatteryPercent();
       String out; serializeJson(doc, out);
       webSocket.sendTXT(num, out);
       break;
@@ -1425,6 +1531,10 @@ void loop() {
     doc["pktDroppedDup"]    = pktDroppedDup;
     doc["pktDroppedNoRoute"]= pktDroppedNoRoute;
     doc["routeDiscoveries"] = routeDiscoveries;
+    // [STEP 4B] Queue-congestion visibility + keep our own battery reading
+    // fresh in the app even between connects (local WS traffic only).
+    doc["pktDroppedQueueFull"] = pktDroppedQueueFull;
+    doc["battery"]              = readBatteryPercent();
     String out; serializeJson(doc, out); wsBroadcast(out);
   }
 

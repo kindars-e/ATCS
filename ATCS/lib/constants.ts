@@ -93,3 +93,44 @@ export const DISCOVERY_REPOLL_DELAY_MS = 1_000;
 // Format: ##PAIR_REQ##<senderName>  e.g. ##PAIR_REQ##Fling_Node1
 export const PAIR_REQUEST_SENTINEL  = "##PAIR_REQ##";
 export const PAIR_ACCEPT_SENTINEL   = "##PAIR_ACK##";
+
+// ── [STEP 6] Location sharing — timing, thresholds, traffic minimization ─────
+// The firmware has NO location-specific code at all — every location message
+// is just opaque text riding the same generic mesh-routed "send" path as a
+// chat message (ACK, retry, route discovery all apply automatically). All of
+// the constants below are pure app-layer policy. Nothing here ever depends
+// on the internet — the whole system, including this feature, must keep
+// working with zero connectivity beyond the local Ranger Wi-Fi/LoRa link.
+
+// A GPS reading worse than this is too imprecise to be useful for finding
+// someone and is held back rather than transmitted (wastes airtime for a fix
+// that won't actually help). The one exception is the automatic SOS location
+// ping, which always sends the best available fix regardless of accuracy —
+// during an emergency, an imprecise fix beats no fix at all.
+export const MAX_USEFUL_GPS_ACCURACY_M = 200;
+
+// [STEP 6] Live share is now event-driven, not a fixed 3s interval:
+//   - a fresh fix is sent as soon as the responder has moved at least
+//     MIN_LOCATION_MOVE_M since the last successfully sent fix, OR
+//   - LIVE_SHARE_HEARTBEAT_MS has elapsed with no movement (so the requester
+//     still gets periodic proof the share is alive even while stationary).
+// LIVE_SHARE_CHECK_INTERVAL_MS is just how often we re-evaluate those two
+// conditions — not how often we transmit.
+export const MIN_LOCATION_MOVE_M        = 15;
+export const LIVE_SHARE_HEARTBEAT_MS    = 30_000;
+export const LIVE_SHARE_CHECK_INTERVAL_MS = 5_000;
+
+// How long to wait for a location-request to be answered before giving up
+// and showing an error instead of spinning forever.
+export const LOCATION_REQUEST_TIMEOUT_MS = 20_000;
+
+// A received location fix older than this is shown with a "stale" warning;
+// older than LOCATION_LOST_MS it's shown as "may no longer be accurate"
+// rather than silently presented as if it were live.
+export const LOCATION_STALE_MS = 30_000;
+export const LOCATION_LOST_MS  = 120_000;
+
+// Debounce window for the automatic SOS location ping — the firmware already
+// resends the same SOS 3x (with jitter) for RF resilience; this prevents us
+// from firing a redundant GPS broadcast for each of those repeats.
+export const SOS_LOCATION_DEBOUNCE_MS = 8_000;

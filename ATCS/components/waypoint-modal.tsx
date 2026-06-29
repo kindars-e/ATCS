@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import useGeolocation from '@/hooks/use-geolocation';
 import { calculateDistance } from '@/lib/geo';
+import { readTrails, writeTrails } from '@/lib/storage';
 import type { Waypoint, Trail } from '@/lib/types';
 
 
@@ -89,30 +90,18 @@ export default function WaypointModal({ onClose, onNavigateToWaypoint }: Waypoin
     };
   }, [showAddWaypoint, position, gpsStatus]);
 
-  // Load trails from localStorage
+  // [STEP 6] Load trails via the shared lib/storage.ts helpers instead of a
+  // raw, hardcoded 'fling-trails' localStorage key duplicated here — both
+  // now revive Dates the same way, in one place.
   useEffect(() => {
-    const savedTrails = localStorage.getItem('fling-trails');
-    if (savedTrails) {
-      const parsed = JSON.parse(savedTrails);
-      const trails = parsed.map((trail: Trail) => ({
-        ...trail,
-        startTime: new Date(trail.startTime),
-        endTime: trail.endTime ? new Date(trail.endTime) : null,
-        waypoints: trail.waypoints.map((wp: Waypoint) => ({
-          ...wp,
-          timestamp: new Date(wp.timestamp)
-        }))
-      }));
-      setTrails(trails);
-      
-      const active = trails.find((t: Trail) => t.active);
-      setActiveTrail(active || null);
-    }
+    const trails = readTrails();
+    setTrails(trails);
+    setActiveTrail(trails.find((t) => t.active) || null);
   }, []);
 
-  // Save trails to localStorage whenever they change
+  // Save trails whenever they change.
   useEffect(() => {
-    localStorage.setItem('fling-trails', JSON.stringify(trails));
+    writeTrails(trails);
   }, [trails]);
 
   // Start a new trail
