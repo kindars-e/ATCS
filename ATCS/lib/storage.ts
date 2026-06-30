@@ -55,7 +55,11 @@ export function readContacts(): Contact[] {
     const parsed = JSON.parse(raw) as Contact[];
     return parsed.map((c) => ({
       ...c,
-      lastSeen: c.lastSeen ? new Date(c.lastSeen) : undefined,
+      lastSeen:        c.lastSeen        ? new Date(c.lastSeen)        : undefined,
+      // [STEP 4A/6 FIX] signalSampledAt was added in Step 4A and stored as
+      // an ISO string in JSON. SignalIndicator calls .getTime() on it, which
+      // throws if it is still a string — crashing the app on every render.
+      signalSampledAt: c.signalSampledAt ? new Date(c.signalSampledAt) : undefined,
       location: c.location
         ? { ...c.location, timestamp: new Date(c.location.timestamp) }
         : undefined,
