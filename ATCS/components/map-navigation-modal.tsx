@@ -116,16 +116,17 @@ export default function MapNavigationModal({
       const initLng = userPosition?.coords.longitude ?? targetLocation?.lng ?? 0;
       const initZoom = (userPosition || targetLocation) ? 16 : 2;
 
+      // [OFFLINE] No tile layer — OSM tiles require internet, which violates
+      // the system's core rule of 100% offline operation. The map still gives
+      // full spatial navigation: user position, destination, route line,
+      // bearing and distance, and waypoints all work with zero network access.
+      // In the field you navigate by bearing + distance, not street labels.
       const map = L.map(mapContainerRef.current, {
         center: [initLat, initLng],
         zoom:   initZoom,
         zoomControl: true,
+        maxZoom: 22,
       });
-
-      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        attribution: "© OpenStreetMap",
-        maxZoom: 19,
-      }).addTo(map);
 
       mapRef.current = map;
       setMapReady(true);
@@ -337,11 +338,10 @@ export default function MapNavigationModal({
             </div>
           </div>
         )}
-        {/* Leaflet CSS injected at runtime */}
+        {/* Dark background so the map space is clearly visible with no tiles */}
         {mapReady && (
           <style>{`
-            .leaflet-container { background: #1f2937; }
-            .leaflet-tile-pane { opacity: 0.9; }
+            .leaflet-container { background: #111827; }
           `}</style>
         )}
       </div>
