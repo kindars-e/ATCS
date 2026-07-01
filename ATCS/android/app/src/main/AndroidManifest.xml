@@ -59,4 +59,15 @@
          first use, which the WebView geolocation API triggers automatically. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!-- [STEP 8] Required for the Beep/Find-User feature: allows the app to
+         trigger the phone's vibration motor when a Beep is received. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!-- [STEP 8] Required for persistent live-location sharing when the app
+         is backgrounded or the screen is locked. Without this, Android 9+
+         throttles or kills GPS access for non-foreground apps. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 </manifest>

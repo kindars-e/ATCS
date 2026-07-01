@@ -75,14 +75,11 @@ export type RangerEvent =
   // [STEP 4B] One node confirmed it received our SOS broadcast. May fire
   // multiple times (once per node that received it) for a single SOS send.
   | { kind: "sos-delivered";      from: string }
-  // [STEP 4A] hops: how many mesh hops away the discovered node is. Used to
-  // tag the RSSI reading as direct (0) vs relayed (>0) — see signalHopDistance.
-  // [STEP 4B] battery: the discovered node's battery level, if it sent one.
-  | { kind: "node-discovered";    deviceId: string; rssi?: number; snr?: number; hops?: number; battery?: number }
-  // [STEP 4A] Relayed RSSI/SNR from a direct neighbor's HELLO beacon — no new
-  // LoRa traffic, just the firmware forwarding a reading it already had.
-  // [STEP 4B] battery: that neighbor's battery level (same HELLO beacon).
-  | { kind: "neighbor-heard";     deviceId: string; rssi?: number; snr?: number; battery?: number }
+  // [STEP 4A] hops: how many mesh hops away the discovered node is.
+  // [STEP 8] battery removed from both events.
+  | { kind: "node-discovered";    deviceId: string; rssi?: number; snr?: number; hops?: number }
+  // [STEP 4A] Relayed RSSI/SNR from a direct neighbor's HELLO beacon.
+  | { kind: "neighbor-heard";     deviceId: string; rssi?: number; snr?: number }
   // [NEW] Another node sent us a ##PAIR_REQ## over LoRa.
   | { kind: "pair-request";       sender: string; senderName: string }
   // [NEW] A node we paired with replied with ##PAIR_ACK## — add them to contacts.
@@ -97,13 +94,9 @@ interface UseRangerConnectionResult {
   connectionState:        ConnectionState;
   isOnline:               boolean;
   connectedDeviceId:      string;
-  connectedDeviceName:    string;   // [NEW] firmware's WIFI_SSID (our display name)
-  // [STEP 4B] Our own connected node's battery level (from device_info /
-  // periodic stats). Undefined until the first frame carrying it arrives.
-  connectedDeviceBattery: number | undefined;
-  // [STEP 4B] Periodic firmware health/diagnostics counters. Null until the
-  // first "stats" frame arrives (firmware only sends it while a phone is
-  // connected, every 5s).
+  connectedDeviceName:    string;
+  // [STEP 8] connectedDeviceBattery removed — no hardware.
+  // [STEP 4B] Periodic firmware health/diagnostics counters.
   nodeStats:              NodeStats | null;
   lastConnectionError:    string;
   reconnectAttempts:      number;
@@ -124,7 +117,7 @@ export function useRangerConnection({
   // in outgoing pair requests so the recipient knows what to call us.
   const [connectedDeviceName, setConnectedDeviceName] = useState("");
   // [STEP 4B] See UseRangerConnectionResult above.
-  const [connectedDeviceBattery, setConnectedDeviceBattery] = useState<number | undefined>(undefined);
+  // [STEP 8] connectedDeviceBattery state removed
   const [nodeStats,           setNodeStats]           = useState<NodeStats | null>(null);
   const [reconnectAttempts,   setReconnectAttempts]   = useState(0);
 
@@ -352,8 +345,7 @@ export function useRangerConnection({
           setConnectedDeviceId(frame.deviceId as string);
           // [NEW] Store the device name (WIFI_SSID) for use in pair requests.
           setConnectedDeviceName((frame.deviceName as string) ?? "");
-          // [STEP 4B] Our own node's battery level, if the firmware sent one.
-          setConnectedDeviceBattery(frame.battery as number | undefined);
+          // [STEP 8] battery removed from device_info
           const freq = frame.frequency as number | undefined;
           if (freq && freq !== 433_000_000) {
             emit({ kind: "frequency-update", frequency: freq });
@@ -377,13 +369,8 @@ export function useRangerConnection({
             pktDroppedNoRoute:   (frame.pktDroppedNoRoute    as number) ?? 0,
             pktDroppedQueueFull: (frame.pktDroppedQueueFull  as number) ?? 0,
             routeDiscoveries:    (frame.routeDiscoveries     as number) ?? 0,
-            battery:             frame.battery as number | undefined,
+            // [STEP 8] battery removed
           });
-          // [STEP 4B] The periodic stats frame also carries our own battery —
-          // keep it fresh even between device_info/connect events.
-          if (frame.battery !== undefined) {
-            setConnectedDeviceBattery(frame.battery as number);
-          }
           break;
         }
 
@@ -409,7 +396,7 @@ export function useRangerConnection({
             rssi:     frame.rssi as number | undefined,
             snr:      frame.snr  as number | undefined,   // [v6] forward SNR
             hops:     frame.hops as number | undefined,    // [STEP 4A]
-            battery:  frame.battery as number | undefined, // [STEP 4B]
+            // [STEP 8] battery removed
           });
           break;
         }
@@ -419,7 +406,6 @@ export function useRangerConnection({
           emit({
             kind:     "neighbor-heard",
             deviceId: (frame.deviceId as string) ?? "",
-            battery:  frame.battery as number | undefined, // [STEP 4B]
             rssi:     frame.rssi as number | undefined,
             snr:      frame.snr  as number | undefined,
           });
@@ -588,7 +574,7 @@ export function useRangerConnection({
     isOnline,
     connectedDeviceId,
     connectedDeviceName,
-    connectedDeviceBattery,
+    // [STEP 8] connectedDeviceBattery removed
     nodeStats,
     lastConnectionError,
     reconnectAttempts,

@@ -45,7 +45,7 @@ import type { Contact } from "@/lib/types";
 export interface DiscoveredNode {
   deviceId: string;
   rssi?:    number;
-  battery?: number; // [STEP 4B]
+  // [STEP 8] battery removed
 }
 
 interface AddDeviceModalProps {
@@ -365,7 +365,7 @@ export default function AddDeviceModal({
                           <p className="text-gray-400 text-xs">
                             {n.rssi} dBm — {rssiLabel(n.rssi)}
                             {/* [STEP 4B] Battery, when the reply included one. */}
-                            {n.battery !== undefined && ` · ${n.battery}% battery`}
+                            {/* [STEP 8] battery display removed */}
                           </p>
                         )}
                       </div>

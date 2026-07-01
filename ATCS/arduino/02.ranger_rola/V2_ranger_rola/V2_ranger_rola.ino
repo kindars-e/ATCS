@@ -370,7 +370,7 @@ struct NeighborEntry {
   unsigned long lastHeard;
   int16_t       rssi;
   float         snr;
-  uint8_t       battery;
+  // [STEP 8] battery field removed
 };
 NeighborEntry neighbors[MAX_NEIGHBORS];
 
@@ -595,19 +595,12 @@ uint8_t       sosRepeatLen    = 0;
 
 unsigned long lastHelloAt = 0;
 
-// ════════════════════════════════════════════════════════════════════════
-// BATTERY (stub — wire to real ADC when hardware supports it)
-// ════════════════════════════════════════════════════════════════════════
-uint8_t readBatteryPercent() {
-  // No fuel-gauge wired on the dev boards used for this demo.
-  // Returning a healthy fixed value keeps mesh behaviour realistic
-  // (no false low-battery no-forward) until real ADC code is added,
-  // e.g.: int mv = analogReadMilliVolts(BATTERY_ADC_PIN); ...
-  return 100;
-}
-
+// [STEP 8] Battery sensing removed: no ADC/fuel-gauge hardware is wired,
+// so the previous 100% stub was actively misleading users. Forwarding is
+// now always allowed (was gated on battery ≥ LOW_BATTERY_FORWARD_CUTOFF_PCT,
+// but the stub always returned 100 anyway — the gate was never real).
 bool forwardingAllowed() {
-  return readBatteryPercent() >= LOW_BATTERY_FORWARD_CUTOFF_PCT;
+  return true;
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -638,14 +631,7 @@ void addOrUpdateNeighbor(const char* id, int16_t rssi, float snr) {
   neighbors[freeSlot].snr       = snr;
 }
 
-void setNeighborBattery(const char* id, uint8_t battery) {
-  for (int i = 0; i < MAX_NEIGHBORS; i++) {
-    if (neighbors[i].inUse && strcmp(neighbors[i].id, id) == 0) {
-      neighbors[i].battery = battery;
-      return;
-    }
-  }
-}
+// [STEP 8] setNeighborBattery() removed — no battery hardware.
 
 // Returns a pointer to a valid route for dest, or nullptr if none known.
 RouteEntry* findRoute(const char* dest) {
@@ -850,10 +836,10 @@ MeshHeader makeHeader(uint8_t type, const char* dst, uint8_t priority, uint8_t p
 }
 
 void sendHello() {
-  MeshHeader h = makeHeader(PKT_HELLO, BROADCAST_ID, PRIO_CONTROL, 1);
+  // [STEP 8] payloadLen now 0 (battery removed)
+  MeshHeader h = makeHeader(PKT_HELLO, BROADCAST_ID, PRIO_CONTROL, 0);
   h.ttl = 1; // HELLO is direct-neighbour-only — never forwarded
-  uint8_t payload[1] = { readBatteryPercent() };
-  enqueuePacket(h, payload, true);
+  enqueuePacket(h, nullptr, true);
 }
 
 void sendRREQ(const char* dest) {
@@ -1134,22 +1120,13 @@ void handleReceivedPacket(const uint8_t* buf, int len, int16_t rssi, float snr) 
   switch (h.type) {
 
     case PKT_HELLO: {
-      setNeighborBattery(h.src, payload[0]);
-
-      // [STEP 4A FIX #1] Relay this direct neighbor's RSSI/SNR to the phone.
-      // HELLO already travels every HELLO_INTERVAL_MS regardless — this adds
-      // NO new LoRa traffic, just one small WS frame over the local WiFi
-      // link to whichever phone is already connected. Lets the app refresh
-      // signal quality (and reachability) for a paired direct neighbor
-      // without ever sending an app-triggered discovery ping.
+      // [STEP 8] Battery removed from HELLO payload.
+      // Relay RSSI/SNR to the phone — no new LoRa traffic.
       doc.clear();
       doc["type"]     = "neighbor";
       doc["deviceId"] = h.src;
       doc["rssi"]     = rssi;
       doc["snr"]      = snr;
-      // [STEP 4B] HELLO's payload[0] is the battery byte we just read above
-      // (setNeighborBattery) — forward it too, still zero new LoRa traffic.
-      doc["battery"]  = payload[0];
       String out; serializeJson(doc, out);
       wsBroadcast(out);
       break; // TTL=1, never forwarded
@@ -1186,13 +1163,9 @@ void handleReceivedPacket(const uint8_t* buf, int len, int16_t rssi, float snr) 
       // for the requester, exactly like RREQ.
       addOrUpdateRoute(h.src, h.prevHop, h.hop);
 
-      // [STEP 4B] Piggyback our battery level on the SAME reply packet that
-      // was already being sent — no new LoRa traffic, just one extra byte.
-      MeshHeader reply = makeHeader(PKT_DISCOVER_REPLY, h.src, PRIO_CONTROL, 2);
-      uint8_t replyPayload[2] = {
-        (uint8_t)(h.hop + 1),    // hops from requester to us
-        readBatteryPercent(),    // our battery level
-      };
+      // [STEP 8] battery removed from reply (1 byte: hop count only)
+      MeshHeader reply = makeHeader(PKT_DISCOVER_REPLY, h.src, PRIO_CONTROL, 1);
+      uint8_t replyPayload[1] = { (uint8_t)(h.hop + 1) };
       forwardUnicast(reply, replyPayload);
 
       if (h.ttl > 0) forwardPacket(h, payload, true);
@@ -1206,11 +1179,8 @@ void handleReceivedPacket(const uint8_t* buf, int len, int16_t rssi, float snr) 
         doc["deviceId"] = h.src;
         doc["rssi"]     = rssi;
         doc["snr"]      = snr;
-        doc["hops"]     = h.payloadLen > 0 ? payload[0] : h.hop; // additive field
-        // [STEP 4B] Only present when the replying node's firmware actually
-        // sent it (payloadLen > 1) — older replies just omit the field
-        // rather than the app reading a garbage byte.
-        if (h.payloadLen > 1) doc["battery"] = payload[1];
+        doc["hops"] = h.payloadLen > 0 ? payload[0] : h.hop;
+        // [STEP 8] battery removed from discovery reply
         String out; serializeJson(doc, out); wsBroadcast(out);
         if (connectedClients > 0 && !isScanning) setLedState(LED_NORMAL);
       } else {
@@ -1403,11 +1373,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
       doc["spreadingFactor"] = LORA_SF;
       doc["bandwidth"]       = (long)LORA_BW;
       // [STEP 4B] Complete the battery telemetry path: the firmware has
-      // always known its own level (readBatteryPercent()) but never told
-      // the phone. Currently a fixed-100 stub on dev boards with no fuel
-      // gauge wired — the plumbing is complete and ready for when real ADC
-      // code is added (see readBatteryPercent()'s comment).
-      doc["battery"]         = readBatteryPercent();
+      // [STEP 8] Battery field removed (no ADC hardware).
       String out; serializeJson(doc, out);
       webSocket.sendTXT(num, out);
       break;
@@ -1555,10 +1521,7 @@ void loop() {
     doc["pktDroppedDup"]    = pktDroppedDup;
     doc["pktDroppedNoRoute"]= pktDroppedNoRoute;
     doc["routeDiscoveries"] = routeDiscoveries;
-    // [STEP 4B] Queue-congestion visibility + keep our own battery reading
-    // fresh in the app even between connects (local WS traffic only).
-    doc["pktDroppedQueueFull"] = pktDroppedQueueFull;
-    doc["battery"]              = readBatteryPercent();
+    doc["pktDroppedQueueFull"] = pktDroppedQueueFull; // [STEP 8] battery removed
     String out; serializeJson(doc, out); wsBroadcast(out);
   }
 

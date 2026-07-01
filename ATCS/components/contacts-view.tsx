@@ -1,6 +1,5 @@
 import {
   Activity,
-  BatteryMedium,
   Navigation,
   Radio,
   RefreshCw,
@@ -36,11 +35,6 @@ interface ContactsViewProps {
   connectionState: ConnectionState;
   reconnectAttempts: number;
   lastConnectionError: string | null;
-  // [STEP 4B] Our own connected node's battery + a way to open the full
-  // diagnostics panel — replaces the previous hardcoded "915MHz / 12km"
-  // placeholder, which didn't match the firmware's actual 433MHz radio and
-  // was an unverified range claim.
-  connectedDeviceBattery?: number;
   onShowNodeStats: () => void;
   showDeleteMenu: string | null;
   onToggleDeleteMenu: (deviceId: string | null) => void;
@@ -58,7 +52,6 @@ export function ContactsView({
   connectionState,
   reconnectAttempts,
   lastConnectionError,
-  connectedDeviceBattery,
   onShowNodeStats,
   showDeleteMenu,
   onToggleDeleteMenu,
@@ -131,17 +124,11 @@ export function ContactsView({
                   actually getting. */}
               <button
                 onClick={onShowNodeStats}
-                className="flex items-center gap-3 text-sm hover:opacity-80 transition-opacity"
+                className="flex items-center gap-2 text-sm hover:opacity-80 transition-opacity"
               >
                 <div className="flex items-center gap-1">
                   <Signal className="h-3.5 w-3.5 text-blue-500" />
                   <span className="text-gray-400">{RADIO_FREQUENCY_HZ / 1_000_000}MHz</span>
-                </div>
-                <div className="flex items-center gap-1">
-                  <BatteryMedium className="h-3.5 w-3.5 text-blue-500" />
-                  <span className="text-gray-400">
-                    {connectedDeviceBattery !== undefined ? `${connectedDeviceBattery}%` : "—"}
-                  </span>
                 </div>
                 <Activity className="h-3.5 w-3.5 text-gray-500" />
               </button>
@@ -271,13 +258,7 @@ export function ContactsView({
                             signalSampledAt={contact.signalSampledAt}
                             signalHopDistance={contact.signalHopDistance}
                           />
-                          {/* [STEP 4B] Battery, when we've ever heard one for this node. */}
-                          {contact.battery !== undefined && (
-                            <span className="inline-flex items-center gap-1 ml-2 text-xs text-gray-500">
-                              <BatteryMedium className="h-3 w-3" />
-                              {contact.battery}%
-                            </span>
-                          )}
+                          {/* [STEP 8] battery display removed */}
                         </div>
                       )}
                       {contact.deviceId !== "*" && (

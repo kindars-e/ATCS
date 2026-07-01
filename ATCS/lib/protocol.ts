@@ -81,15 +81,16 @@ export type OutgoingFrame =
 export type IncomingFrame =
   // [NEW] broadcast?: true when this message arrived as a LoRa "*" broadcast.
   | { type: "message";     sender: string; data: string; rssi?: number; broadcast?: boolean }
+  // [STEP 8] battery removed from all incoming frames
   | { type: "device_info"; deviceId: string; deviceName: string; frequency?: number;
-                           spreadingFactor?: number; bandwidth?: number; battery?: number }
-  | { type: "stats";       messagesSent: number; messagesReceived: number; uptime: number;
-                           connectedClients: number; pktForwarded: number; pktDroppedDup: number;
-                           pktDroppedNoRoute: number; pktDroppedQueueFull: number;
-                           routeDiscoveries: number; battery?: number }
+                           spreadingFactor?: number; bandwidth?: number }
+  | { type: "stats";       pktSent: number; appMsgSent: number; messagesReceived: number;
+                           uptime: number; connectedClients: number; pktForwarded: number;
+                           pktDroppedDup: number; pktDroppedNoRoute: number;
+                           pktDroppedQueueFull: number; routeDiscoveries: number }
   | { type: "delivery";    status: "delivered" | "failed" | "sos_received"; dest?: string; from?: string }
-  | { type: "discovery";   deviceId: string; rssi?: number; hops?: number; battery?: number }
-  | { type: "neighbor";    deviceId: string; rssi?: number; snr?: number; battery?: number };
+  | { type: "discovery";   deviceId: string; rssi?: number; hops?: number }
+  | { type: "neighbor";    deviceId: string; rssi?: number; snr?: number };
 
 // ── Decoded message types ─────────────────────────────────────────────────────
 export type DecodedMessage =

@@ -82,7 +82,13 @@ import type {
 } from "@/lib/types";
 
 import AddDeviceModal, { type DiscoveredNode } from "./add-device-modal";
-import WaypointModal       from "./waypoint-modal";
+import dynamic from "next/dynamic";
+// [STEP 8] Leaflet is browser-only — use dynamic import so the static
+// Next.js export doesn't try to SSR the map component.
+const MapNavigationModal = dynamic(
+  () => import("./map-navigation-modal"),
+  { ssr: false },
+);
 import WiFiConnectionModal from "./wifi-connection-modal";
 import { SplashScreen }    from "./splash-screen";
 import { CompassModal }    from "./compass-modal";
@@ -138,6 +144,11 @@ export default function FlingApp() {
   ]);
 
   const [showWaypoints,  setShowWaypoints]  = useState(false);
+  // [STEP 8] Live user GPS for passing into the map component. We use the
+  // raw browser API here (not the hook) to keep this light — the hook's
+  // watchPosition is reserved for live-share sessions.
+  const [userGpsPosition, setUserGpsPosition] = useState<GeolocationPosition | null>(null);
+  const mapGpsWatchIdRef = useRef<number | null>(null);
   // [NEW] Messages are now seeded from localStorage so the Emergency thread and
   // private chats survive a page reload. readMessages() returns {} on first run.
   const [messages,       setMessages]       = useState<Record<string, Message[]>>(() => readMessages());
@@ -326,17 +337,22 @@ export default function FlingApp() {
   }, []);
 
   useEffect(() => {
+    // Cleanup on unmount — stop the GPS watch.
     return () => {
+      if (liveShareWatchIdRef.current !== null) {
+        navigator.geolocation?.clearWatch(liveShareWatchIdRef.current);
+      }
       if (liveShareCheckTimerRef.current) clearInterval(liveShareCheckTimerRef.current);
     };
   }, []);
 
-  // ── [STEP 6] Master location state reset — the "fully tear down" option,
-  // used for WiFi-level disconnects and explicit user cancellation. A
-  // transient WS-level hiccup is handled separately (see the isOnline
-  // recovery effect below) and does NOT call this — it pauses/resumes the
-  // live-share session in place instead of discarding it. ──────────────────
+  // ── Master location state reset (full teardown) ───────────────────────────
   const resetAllLocationState = useCallback(() => {
+    // Stop continuous GPS watch when the session ends.
+    if (liveShareWatchIdRef.current !== null) {
+      navigator.geolocation?.clearWatch(liveShareWatchIdRef.current);
+      liveShareWatchIdRef.current = null;
+    }
     if (liveShareCheckTimerRef.current) {
       clearInterval(liveShareCheckTimerRef.current);
       liveShareCheckTimerRef.current = null;
@@ -407,12 +423,11 @@ export default function FlingApp() {
   //     Otherwise the previous reading (and its age) is left exactly as-is
   //     — we never fabricate or silently "refresh" a signal value just
   //     because the node proved reachable some other way.
-  //   - battery ([STEP 4B]): only touched when THIS event actually carried
-  //     a battery reading (discovery reply or relayed HELLO); otherwise the
+  //   - [STEP 8] battery removed from all paths
   //     previous value is kept.
   // ════════════════════════════════════════════════════════════════════════
   const recordNodeHeard = useCallback(
-    (deviceId: string, rssi?: number, snr?: number, hopDistance?: number, battery?: number) => {
+    (deviceId: string, rssi?: number, snr?: number, hopDistance?: number) => {
       if (!deviceId || deviceId === EMERGENCY_BROADCAST_ID) return;
       const now = new Date();
       const hasSample = rssi !== undefined;
@@ -428,7 +443,7 @@ export default function FlingApp() {
                 signalSampledAt:    hasSample ? now            : c.signalSampledAt,
                 signalHopDistance:  hasSample ? hopDistance    : c.signalHopDistance,
                 signalQuality:      hasSample ? classifySignalQuality(rssi) : c.signalQuality,
-                battery:            battery ?? c.battery,
+                // [STEP 8] battery removed
               }
             : c,
         ),
@@ -455,9 +470,34 @@ export default function FlingApp() {
         // "BEEP" which just showed up as a chat bubble — not the buzz the
         // UI's own label promises. Beep is always 1:1 (never broadcast), so
         // it's safe to special-case here without touching the protocol.
+        // [STEP 8] Beep: vibrate + play an audible alert tone via Web Audio.
+        // The VIBRATE manifest permission is now declared so the call
+        // actually works on Android in Capacitor's WebView.
         if (!event.broadcast && event.content === "BEEP") {
+          // Vibration (requires VIBRATE manifest permission)
           if (typeof navigator !== "undefined" && "vibrate" in navigator) {
-            navigator.vibrate([200, 100, 200]);
+            navigator.vibrate([300, 100, 300, 100, 300]);
+          }
+          // Audible alert via Web Audio API (works offline, no network needed)
+          try {
+            const ctx = new (window.AudioContext || (window as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext)();
+            const playBeep = (startAt: number, freq: number) => {
+              const osc = ctx.createOscillator();
+              const gain = ctx.createGain();
+              osc.connect(gain);
+              gain.connect(ctx.destination);
+              osc.type = "sine";
+              osc.frequency.value = freq;
+              gain.gain.setValueAtTime(0.4, startAt);
+              gain.gain.exponentialRampToValueAtTime(0.001, startAt + 0.3);
+              osc.start(startAt);
+              osc.stop(startAt + 0.35);
+            };
+            playBeep(ctx.currentTime, 880);
+            playBeep(ctx.currentTime + 0.4, 880);
+            playBeep(ctx.currentTime + 0.8, 1100);
+          } catch {
+            // Web Audio not available — vibration alone is the fallback
           }
           return;
         }
@@ -652,6 +692,7 @@ export default function FlingApp() {
           prev?.deviceId === event.sender ? { ...prev, location: newLocation } : prev,
         );
         if (locationRequestTargetRef.current?.deviceId === event.sender) {
+          // Response to our explicit one-time request — open compass.
           if (locationRequestTimeoutRef.current) {
             clearTimeout(locationRequestTimeoutRef.current);
             locationRequestTimeoutRef.current = null;
@@ -661,6 +702,13 @@ export default function FlingApp() {
           setShowLocationRequest(false);
           setShowCompass(true);
           setTimeout(() => setLocationDebugMessage(""), 2000);
+        } else if (event.broadcast) {
+          // [STEP 8] SOS auto-location: the sender broadcast their location
+          // alongside an SOS. Show a notice so any receiver can tap to
+          // navigate toward the emergency origin immediately.
+          const senderName = contactsRef.current.find((c) => c.deviceId === event.sender)
+            ?.deviceName || `Ranger ${event.sender}`;
+          setLocationNotice(`📍 ${senderName} shared their location — tap their contact to navigate`);
         }
         return;
       }
@@ -751,12 +799,9 @@ export default function FlingApp() {
         // We never clear the list here — the modal manages that via resetDiscovery.
         setDiscoveredNodes((prev) => {
           if (prev.some((n) => n.deviceId === event.deviceId)) return prev;
-          return [...prev, { deviceId: event.deviceId, rssi: event.rssi, battery: event.battery }];
+          return [...prev, { deviceId: event.deviceId, rssi: event.rssi }];
         });
-        // [v6] If this node is already a saved contact, a discovery reply also
-        // proves it's reachable — refresh its reachability + signal reading.
-        // hops tags the reading as direct (0) vs relayed (>0).
-        recordNodeHeard(event.deviceId, event.rssi, event.snr, event.hops, event.battery);
+        recordNodeHeard(event.deviceId, event.rssi, event.snr, event.hops);
         return;
       }
 
@@ -765,7 +810,7 @@ export default function FlingApp() {
       // already had from its existing HELLO_INTERVAL_MS beacon. hopDistance
       // is always 0 here since HELLO is direct-neighbor-only (TTL=1).
       case "neighbor-heard": {
-        recordNodeHeard(event.deviceId, event.rssi, event.snr, 0, event.battery);
+        recordNodeHeard(event.deviceId, event.rssi, event.snr, 0);
         return;
       }
 
@@ -828,7 +873,7 @@ export default function FlingApp() {
     isOnline,
     connectedDeviceId,
     connectedDeviceName,
-    connectedDeviceBattery,
+    // [STEP 8] connectedDeviceBattery removed
     nodeStats,
     lastConnectionError,
     reconnectAttempts,
@@ -1086,76 +1131,66 @@ export default function FlingApp() {
     }
   }, [isOnline, locationRequestStatus]);
 
+  // ── [STEP 8] PERSISTENT LIVE LOCATION SHARING ─────────────────────────────
+  // Root cause of the previous unreliability: the old implementation called
+  // getCurrentPosition() every 2 seconds via setInterval. Android throttles
+  // and kills those cold-start GPS requests the moment the screen locks or
+  // the app is backgrounded. The fix is to use a SINGLE watchPosition() that
+  // keeps the GPS lock continuously active. Android allows watchPosition to
+  // survive lock/background when FOREGROUND_SERVICE_LOCATION is declared in
+  // the manifest (now added in Step 8) and the Capacitor App plugin keeps
+  // the JS engine alive.
+  //
+  // Session state lives here in refs (root component) so it survives any
+  // view change — the user can navigate away and come back without losing it.
+  const liveShareWatchIdRef   = useRef<number | null>(null);
+  // Tracks position purely for heartbeat purposes when watchPosition fires
+  // but we don't want to send (e.g. no movement, heartbeat not due yet).
+
   const stopLiveShare = useCallback(() => {
-    // [STEP 6] Tell the requester explicitly, best-effort — if this
-    // particular packet doesn't make it, their own staleness display
-    // (Compass modal) will convey the same thing a bit later anyway.
+    // Tell the requester explicitly before clearing.
     const session = liveShareSessionRef.current;
     if (session) sendFrame(encodeLocationStop(session.targetId));
+
+    // Stop the watchPosition GPS lock.
+    if (liveShareWatchIdRef.current !== null) {
+      navigator.geolocation?.clearWatch(liveShareWatchIdRef.current);
+      liveShareWatchIdRef.current = null;
+    }
     resetAllLocationState();
   }, [sendFrame, resetAllLocationState]);
 
-  // [STEP 6] One GPS read + one (gated) send. Shared by both the initial
-  // accept-and-share-once call and the recurring adaptive check below, so
-  // both paths apply the exact same accuracy validation and exact same
-  // "don't lie about success" UI feedback.
-  const tryShareCurrentPosition = useCallback(
-    (targetId: string, isFirstSend: boolean) => {
-      if (!navigator.geolocation) {
-        setLocationDebugMessage("Geolocation not supported on this device.");
-        return;
+  // Called from the watchPosition success callback and from the heartbeat
+  // check. Returns true if a location frame was actually sent.
+  const trySendPosition = useCallback(
+    (pos: GeolocationPosition, isFirstSend: boolean): boolean => {
+      const { latitude, longitude, accuracy } = pos.coords;
+      const session = liveShareSessionRef.current;
+      if (!session || session.status !== "active") return false;
+
+      // Skip inaccurate fixes UNLESS it's the very first send — the requester
+      // needs any position immediately even if GPS hasn't fully acquired yet.
+      if (!isFirstSend && accuracy > MAX_USEFUL_GPS_ACCURACY_M) {
+        setLocationDebugMessage(`Waiting for better GPS (±${Math.round(accuracy)}m)…`);
+        return false;
       }
-      navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          const { latitude, longitude, accuracy } = pos.coords;
 
-          // [STEP 7] First send always goes through regardless of accuracy —
-          // the requester needs SOME location immediately even if the GPS
-          // hasn't fully acquired yet. Subsequent updates apply the accuracy
-          // gate so we don't spam poor fixes during continuous sharing.
-          if (!isFirstSend && accuracy > MAX_USEFUL_GPS_ACCURACY_M) {
-            setLocationDebugMessage(`Waiting for better GPS (±${Math.round(accuracy)}m)…`);
-            return;
-          }
+      const sent = sendFrame(encodeLocationResponse(session.targetId, latitude, longitude, accuracy));
+      if (!sent) {
+        setLocationDebugMessage("Connection issue — update not delivered.");
+        return false;
+      }
 
-          const sent = sendFrame(encodeLocationResponse(targetId, latitude, longitude, accuracy));
-          if (!sent) {
-            // [STEP 6] Don't claim success when it didn't go through — the
-            // isOnline recovery effect below decides whether to pause the
-            // session or this was just a one-off blip.
-            setLocationDebugMessage("Connection issue — last update did not go through.");
-            return;
-          }
-
-          const session = liveShareSessionRef.current;
-          if (session) {
-            session.lastSentAt = Date.now();
-            session.lastSentPosition = { lat: latitude, lng: longitude };
-            session.status = "active";
-          }
-          setLocationDebugMessage(
-            isFirstSend
-              ? `🎯 Sharing live ✓ (±${Math.round(accuracy)}m)`
-              : `Updated ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} (±${Math.round(accuracy)}m)`,
-          );
-        },
-        (err) => {
-          if (err.code === err.PERMISSION_DENIED) {
-            setLocationDebugMessage("Location permission denied. Enable in device settings.");
-            stopLiveShare(); // can't recover — user explicitly denied
-          } else {
-            // [STEP 7] TIMEOUT or POSITION_UNAVAILABLE are transient — do NOT
-            // stop the session, just note it and try again on the next tick.
-            setLocationDebugMessage("GPS error — retrying on next update…");
-          }
-        },
-        // [STEP 7] First send: allow a 30-second cached position for instant
-        // response (avoids the full GPS cold-start delay on first location
-        // share). Subsequent sends always use a fresh fix (maximumAge: 0).
-        { enableHighAccuracy: true, timeout: 10000, maximumAge: isFirstSend ? 30000 : 0 },
+      session.lastSentAt = Date.now();
+      session.lastSentPosition = { lat: latitude, lng: longitude };
+      setLocationDebugMessage(
+        isFirstSend
+          ? `🎯 Sharing live ✓ (±${Math.round(accuracy)}m)`
+          : `Updated ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} (±${Math.round(accuracy)}m)`,
       );
+      return true;
     },
-    [sendFrame, stopLiveShare],
+    [sendFrame],
   );
 
   const acceptLocationShare = useCallback(() => {
@@ -1174,57 +1209,108 @@ export default function FlingApp() {
     };
     setLocationDebugMessage("Getting your location…");
 
-    tryShareCurrentPosition(targetId, true);
+    // Clear any previous watch before starting a new one.
+    if (liveShareWatchIdRef.current !== null) {
+      navigator.geolocation.clearWatch(liveShareWatchIdRef.current);
+    }
 
-    // [STEP 6] Event-driven, not a fixed-interval blast: this timer just
-    // re-evaluates every LIVE_SHARE_CHECK_INTERVAL_MS whether a fresh fix is
-    // actually WORTH sending — real movement (>= MIN_LOCATION_MOVE_M) OR the
-    // heartbeat elapsed with no movement — instead of unconditionally
-    // transmitting on a fixed clock regardless of whether anything changed.
-    if (liveShareCheckTimerRef.current) clearInterval(liveShareCheckTimerRef.current);
-    liveShareCheckTimerRef.current = setInterval(() => {
-      const session = liveShareSessionRef.current;
-      if (!session || session.status !== "active") return; // paused — connection down
+    let isFirstCallback = true;
 
-      navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          const { latitude, longitude } = pos.coords;
-          const sinceLastSend = Date.now() - session.lastSentAt;
-          const moved = session.lastSentPosition
-            ? calculateDistance(session.lastSentPosition.lat, session.lastSentPosition.lng, latitude, longitude)
-            : Infinity; // no fix sent yet this session — always send the first one
+    // watchPosition keeps GPS locked continuously — survives phone lock and
+    // app backgrounding. The callback fires whenever the GPS gets a new fix
+    // (typically every 1-5 s on Android with enableHighAccuracy).
+    liveShareWatchIdRef.current = navigator.geolocation.watchPosition(
+      (pos) => {
+        const session = liveShareSessionRef.current;
+        if (!session) return;
 
-          if (moved >= MIN_LOCATION_MOVE_M || sinceLastSend >= LIVE_SHARE_HEARTBEAT_MS) {
-            tryShareCurrentPosition(targetId, false);
-          }
-        },
-        () => { /* a one-off read failure here just means we try again next tick */ },
-        { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 },
-      );
-    }, LIVE_SHARE_CHECK_INTERVAL_MS);
-  }, [incomingLocationRequest, tryShareCurrentPosition]);
+        const { latitude, longitude } = pos.coords;
+        const sinceLastSend = Date.now() - session.lastSentAt;
+        const moved = session.lastSentPosition
+          ? calculateDistance(
+              session.lastSentPosition.lat, session.lastSentPosition.lng,
+              latitude, longitude,
+            )
+          : Infinity; // no prior fix — always send
 
-  // [STEP 6] Recovery after temporary connection loss: pause sending while
-  // the WS link is down (no point burning GPS reads we can't transmit
-  // anyway), and resume immediately — not on the next scheduled tick —
-  // the moment it comes back, so the requester doesn't see a multi-minute
-  // gap just because the link blipped for a few seconds.
+        // Send if: first ever fix, OR meaningful movement, OR heartbeat due.
+        if (isFirstCallback || moved >= MIN_LOCATION_MOVE_M || sinceLastSend >= LIVE_SHARE_HEARTBEAT_MS) {
+          trySendPosition(pos, isFirstCallback);
+          isFirstCallback = false;
+        }
+      },
+      (err) => {
+        if (err.code === err.PERMISSION_DENIED) {
+          setLocationDebugMessage("Location permission denied. Enable in device settings.");
+          stopLiveShare();
+        } else {
+          // TIMEOUT / POSITION_UNAVAILABLE — transient; keep the watch alive.
+          setLocationDebugMessage("GPS signal weak — retrying…");
+        }
+      },
+      {
+        enableHighAccuracy: true,
+        // No timeout on watchPosition — it keeps trying indefinitely.
+        // maximumAge: 0 ensures we always get fresh positions, not cached.
+        maximumAge: 0,
+      },
+    );
+  }, [incomingLocationRequest, trySendPosition, stopLiveShare]);
+
+  // Connection recovery: when WS comes back after a drop, mark session active
+  // again (watchPosition is already running — no restart needed, just let the
+  // next GPS callback fire and send).
   useEffect(() => {
     const session = liveShareSessionRef.current;
     if (!session) return;
     if (!isOnline && session.status === "active") {
       session.status = "paused";
-      setLocationDebugMessage("Connection lost — will resume sharing automatically.");
+      setLocationDebugMessage("Connection lost — will resume when reconnected.");
     } else if (isOnline && session.status === "paused") {
       session.status = "active";
-      tryShareCurrentPosition(session.targetId, false);
+      setLocationDebugMessage("Reconnected — resuming location sharing.");
     }
-  }, [isOnline, tryShareCurrentPosition]);
+  }, [isOnline]);
+
+  // App resume handler: if the user comes back from a lock/background and
+  // watchPosition was killed by the OS (rare but possible), restart it.
+  // The existing appStateChange effect in use-ranger-connection.ts handles
+  // the WS reconnect; here we only need to restart GPS if necessary.
+  useEffect(() => {
+    // This ref access is safe — if watchPosition is alive, its ID is set;
+    // if it was killed, the navigator returns false for the watch ID.
+    // Since we can't truly detect OS-killed watches in JS, we rely on the
+    // fact that watchPosition on Android with the FOREGROUND_SERVICE_LOCATION
+    // permission should NOT be killed. This effect is a safety net.
+    const handleAppResume = () => {
+      const session = liveShareSessionRef.current;
+      if (!session || session.status !== "active") return;
+      if (liveShareWatchIdRef.current === null && navigator.geolocation) {
+        // watchPosition was stopped — restart it.
+        acceptLocationShare();
+      }
+    };
+    window.addEventListener("focus", handleAppResume);
+    return () => window.removeEventListener("focus", handleAppResume);
+  }, [acceptLocationShare]);
 
   // ════════════════════════════════════════════════════════════════════════
-  // WAYPOINT NAVIGATION
+  // [STEP 8] Navigation — opens the map modal, starts GPS if available.
+  // Legacy handleWaypointNavigation kept for any remaining call sites.
   // ════════════════════════════════════════════════════════════════════════
+  const openMapNavigation = useCallback(() => {
+    if (navigator.geolocation && mapGpsWatchIdRef.current === null) {
+      mapGpsWatchIdRef.current = navigator.geolocation.watchPosition(
+        (pos) => setUserGpsPosition(pos),
+        () => {},
+        { enableHighAccuracy: true, maximumAge: 0 },
+      );
+    }
+    setShowWaypoints(true);
+  }, []);
+
   const handleWaypointNavigation = (waypoint: Waypoint) => {
+    // Legacy: used by compass modal when navigating to a saved waypoint.
     setCurrentContact({
       deviceId:        `waypoint-${waypoint.id}`,
       deviceName:      waypoint.name,
@@ -1303,11 +1389,10 @@ export default function FlingApp() {
           connectionState={connectionState}
           reconnectAttempts={reconnectAttempts}
           lastConnectionError={lastConnectionError}
-          connectedDeviceBattery={connectedDeviceBattery}
           onShowNodeStats={() => setShowNodeStats(true)}
           showDeleteMenu={showDeleteMenu}
           onToggleDeleteMenu={setShowDeleteMenu}
-          onShowWaypoints={() => setShowWaypoints(true)}
+          onShowWaypoints={openMapNavigation}
           onShowAddContact={() => {
             resetDiscovery();    // clear stale results when opening modal
             setShowAddContact(true);
@@ -1366,17 +1451,22 @@ export default function FlingApp() {
           frequencyHz={RADIO_FREQUENCY_HZ}
           spreadingFactor={RADIO_SPREADING_FACTOR}
           bandwidthHz={RADIO_BANDWIDTH_HZ}
-          battery={connectedDeviceBattery}
           stats={nodeStats}
           onClose={() => setShowNodeStats(false)}
         />
       )}
 
-      {/* ── Waypoints ────────────────────────────────────────────────────── */}
+      {/* ── [STEP 8] Map-based navigation (replaces text-only WaypointModal) */}
       {showWaypoints && (
-        <WaypointModal
-          onClose={() => setShowWaypoints(false)}
-          onNavigateToWaypoint={handleWaypointNavigation}
+        <MapNavigationModal
+          userPosition={userGpsPosition}
+          onClose={() => {
+            setShowWaypoints(false);
+            if (mapGpsWatchIdRef.current !== null) {
+              navigator.geolocation?.clearWatch(mapGpsWatchIdRef.current);
+              mapGpsWatchIdRef.current = null;
+            }
+          }}
         />
       )}
 

@@ -25,12 +25,7 @@ export type Contact = {
   signalSampledAt?: Date;     // when rssi/snr was actually measured
   signalHopDistance?: number; // 0 = direct neighbor (HELLO-relay), >0 = relayed/multi-hop
   location?: ContactLocation;
-  // [STEP 4B] Battery percentage reported by the node itself, via a relayed
-  // HELLO beacon (direct neighbor) or a discovery reply (possibly multi-hop).
-  // Undefined until we've heard it at least once. On current dev hardware
-  // this is always 100 (no fuel gauge wired) — see readBatteryPercent() in
-  // the firmware — but the telemetry path itself is complete end to end.
-  battery?: number;
+  // [STEP 8] battery removed — no hardware to read it from.
 };
 
 // [STEP 4B] Periodic firmware health/diagnostics counters, surfaced as-is
@@ -41,17 +36,17 @@ export type Contact = {
 //   appMsgSent   = only user-originated messages (chat, beep, location)
 // The old "messagesSent" field was pktSent under a misleading name.
 export type NodeStats = {
-  pktSent: number;       // all LoRa transmissions (renamed from messagesSent)
-  appMsgSent: number;    // user messages only
+  pktSent: number;          // all LoRa transmissions
+  appMsgSent: number;       // user messages only
   messagesReceived: number;
-  uptime: number; // seconds since the node booted
+  uptime: number;           // seconds since boot
   connectedClients: number;
   pktForwarded: number;
   pktDroppedDup: number;
   pktDroppedNoRoute: number;
   pktDroppedQueueFull: number;
   routeDiscoveries: number;
-  battery?: number; // this node's own battery level
+  // [STEP 8] battery removed
 };
 
 // [STEP 4A] Time-only reachability. Never influenced by signal strength.
