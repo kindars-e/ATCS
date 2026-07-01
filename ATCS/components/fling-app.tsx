@@ -152,6 +152,9 @@ export default function FlingApp() {
   const [showAddContact, setShowAddContact] = useState(false);
   const [showDeleteMenu, setShowDeleteMenu] = useState<string | null>(null);
   const [showCompass,    setShowCompass]    = useState(false);
+  // [Step 9 — Issue 2] Active navigation contact: set when compass opens,
+  // persists when compass is minimised so the session can be resumed.
+  const [activeNavContact, setActiveNavContact] = useState<Contact | null>(null);
 
   // [v6 RANGE DETECTION] Transient banner shown when a node's reachability
   // changes (e.g. "Ranger B is out of range"). Auto-clears after a few seconds.
@@ -238,6 +241,19 @@ export default function FlingApp() {
   useEffect(() => { contactsRef.current = contacts; }, [contacts]);
 
   useEffect(() => { writeContacts(contacts); }, [contacts]);
+
+  // [Step 9 — Issue 5] Auto-stop navigation when the contact goes offline.
+  // The range monitor updates `contacts` every 5s; when the navigated contact
+  // transitions to "offline" we close the compass and notify the user instead
+  // of leaving them navigating to a ghost location.
+  useEffect(() => {
+    if (!showCompass || !activeNavContact) return;
+    const live = contacts.find((c) => c.deviceId === activeNavContact.deviceId);
+    if (live?.reachability === "offline") {
+      setShowCompass(false);
+      setRangeNotice(`Navigation stopped — ${activeNavContact.deviceName} is offline`);
+    }
+  }, [contacts, showCompass, activeNavContact]);
   // [NEW] Persist every change to the message threads so emergency history and
   // private conversations are not lost on reload.
   useEffect(() => { writeMessages(messages); }, [messages]);
@@ -724,6 +740,7 @@ export default function FlingApp() {
           setLocationDebugMessage("🎯 Live tracking started!");
           setShowLocationRequest(false);
           setShowCompass(true);
+          setActiveNavContact(locationRequestTargetRef.current); // [Step 9]
           setTimeout(() => setLocationDebugMessage(""), 2000);
         } else if (event.broadcast) {
           // [STEP 9] SOS auto-location: immediately save the sender's
@@ -1352,7 +1369,7 @@ export default function FlingApp() {
   }, []);
 
   const handleNamedWaypointNavigate = useCallback((wp: NamedWaypoint) => {
-    setCurrentContact({
+    const navContact: Contact = {
       deviceId:        `waypoint-${wp.id}`,
       deviceName:      wp.name,
       frequency:       RADIO_FREQUENCY_HZ,
@@ -1361,7 +1378,9 @@ export default function FlingApp() {
       unreadCount:     0,
       reachability:    "offline",
       location:        { lat: wp.lat, lng: wp.lng, accuracy: 0, timestamp: wp.createdAt },
-    });
+    };
+    setCurrentContact(navContact);
+    setActiveNavContact(navContact); // [Step 9]
     setShowCompass(true);
     setShowWaypoints(false);
   }, []);
@@ -1584,28 +1603,26 @@ export default function FlingApp() {
         </div>
       )}
 
-      {/* [STEP 9] Compact live-sharing banner — replaces the old full-screen
-          blocking overlay once the user accepts. This lets them use the whole
-          app (navigate views, chat, etc.) while sharing continues in the
-          background via the persistent watchPosition GPS lock. */}
+      {/* [Step 9 — Issue 3] Live-sharing pill — repositioned from bottom-0
+          (which covered the chat input) to a slim floating strip just below
+          the header/status bar area (top-14 ≈ 56px). This is consistent with
+          how modern navigation apps surface persistent session indicators
+          without blocking any interactive content. */}
       {liveSharingActive && (
-        <div className="fixed bottom-0 left-0 right-0 z-50 safe-bottom pointer-events-auto">
-          <div className="mx-3 mb-3 bg-emerald-900 border border-emerald-600 rounded-2xl px-4 py-3 flex items-center justify-between shadow-xl">
-            <div className="flex items-center gap-2.5 min-w-0">
-              <span className="h-2.5 w-2.5 rounded-full bg-emerald-400 animate-pulse flex-shrink-0" />
-              <div className="min-w-0">
-                <p className="text-sm font-semibold text-white truncate">
-                  Sharing live location
-                </p>
-                {locationDebugMessage && (
-                  <p className="text-xs text-emerald-300 truncate">{locationDebugMessage}</p>
-                )}
-              </div>
+        <div className="fixed top-14 left-0 right-0 z-40 flex justify-center px-4 pointer-events-auto">
+          <div className="bg-emerald-900/95 border border-emerald-700 rounded-2xl px-4 py-2.5
+                          flex items-center gap-3 shadow-xl max-w-xs w-full">
+            <span className="h-2.5 w-2.5 rounded-full bg-emerald-400 animate-pulse flex-shrink-0" />
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-semibold text-white truncate">Sharing live location</p>
+              {locationDebugMessage && (
+                <p className="text-xs text-emerald-300 truncate">{locationDebugMessage}</p>
+              )}
             </div>
             <Button
               onClick={stopLiveShare}
               size="sm"
-              className="bg-red-600 hover:bg-red-700 text-white rounded-xl px-4 flex-shrink-0 ml-3"
+              className="bg-red-600 hover:bg-red-700 text-white rounded-xl px-3 flex-shrink-0 text-xs"
             >
               Stop
             </Button>
@@ -1655,13 +1672,47 @@ export default function FlingApp() {
         </div>
       )}
 
+      {/* [Step 9] Navigation resume pill — shown when a nav session is
+          active but the compass has been minimised. Tapping it reopens
+          the compass; the X ends the session completely. */}
+      {activeNavContact && !showCompass && (
+        <div className="fixed top-14 left-0 right-0 z-40 flex justify-center px-4 pointer-events-auto">
+          <div className="bg-blue-900/95 border border-blue-700 rounded-2xl px-4 py-2.5
+                          flex items-center gap-3 shadow-xl max-w-xs w-full">
+            <span className="h-2.5 w-2.5 rounded-full bg-blue-400 animate-pulse flex-shrink-0" />
+            <button
+              onClick={() => setShowCompass(true)}
+              className="text-sm font-semibold text-white truncate flex-1 text-left"
+            >
+              Navigate → {activeNavContact.deviceName}
+            </button>
+            <button
+              onClick={() => {
+                setActiveNavContact(null);
+                resetAllLocationState();
+              }}
+              className="p-1 text-blue-400 hover:text-white flex-shrink-0"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* ── Compass / navigation ─────────────────────────────────────────── */}
       {showCompass && currentContact && (
         <CompassModal
-          contact={currentContact}
+          // [Step 9 — Issue 5] Pass the LIVE contact from the contacts array
+          // (not the stale snapshot in currentContact) so the compass receives
+          // real-time reachability updates from the range monitor.
+          contact={contacts.find((c) => c.deviceId === currentContact.deviceId) ?? currentContact}
           onBeep={(deviceId) => sendFrame(encodeBeep(deviceId))}
+          // [Step 9 — Issue 2] Minimise: hides compass but keeps nav session.
+          onMinimize={() => setShowCompass(false)}
+          // Explicit close: ends the session completely.
           onClose={() => {
             setShowCompass(false);
+            setActiveNavContact(null);
             resetAllLocationState();
           }}
         />
