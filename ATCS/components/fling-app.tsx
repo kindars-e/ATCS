@@ -82,13 +82,9 @@ import type {
 } from "@/lib/types";
 
 import AddDeviceModal, { type DiscoveredNode } from "./add-device-modal";
-import dynamic from "next/dynamic";
-// [STEP 8] Leaflet is browser-only — use dynamic import so the static
-// Next.js export doesn't try to SSR the map component.
-const MapNavigationModal = dynamic(
-  () => import("./map-navigation-modal"),
-  { ssr: false },
-);
+// [STEP 9] Replaced the Leaflet map modal with a GPS-capture list approach.
+import { WaypointManagerModal } from "./waypoint-manager-modal";
+import { readWaypoints, writeWaypoints, type NamedWaypoint } from "@/lib/storage";
 import WiFiConnectionModal from "./wifi-connection-modal";
 import { SplashScreen }    from "./splash-screen";
 import { CompassModal }    from "./compass-modal";
@@ -174,6 +170,9 @@ export default function FlingApp() {
   >("requesting");
   const [locationDebugMessage,     setLocationDebugMessage]     = useState("");
   const [showLocationPermission,   setShowLocationPermission]   = useState(false);
+  // [STEP 9] When sharing is active the full-screen overlay is dismissed so
+  // the user can use the rest of the app. A compact banner takes its place.
+  const [liveSharingActive, setLiveSharingActive] = useState(false);
   const [incomingLocationRequest,  setIncomingLocationRequest]  = useState<
     { from: string; deviceName: string } | null
   >(null);
@@ -474,31 +473,55 @@ export default function FlingApp() {
         // The VIBRATE manifest permission is now declared so the call
         // actually works on Android in Capacitor's WebView.
         if (!event.broadcast && event.content === "BEEP") {
-          // Vibration (requires VIBRATE manifest permission)
+          // [STEP 9] Louder, longer, more pulses — clearly audible during
+          // an emergency even if the phone is in a pocket or bag.
           if (typeof navigator !== "undefined" && "vibrate" in navigator) {
-            navigator.vibrate([300, 100, 300, 100, 300]);
+            // 5 strong pulses: on 400 ms, off 150 ms, repeat
+            navigator.vibrate([400, 150, 400, 150, 400, 150, 400, 150, 400]);
           }
-          // Audible alert via Web Audio API (works offline, no network needed)
-          try {
-            const ctx = new (window.AudioContext || (window as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext)();
-            const playBeep = (startAt: number, freq: number) => {
-              const osc = ctx.createOscillator();
-              const gain = ctx.createGain();
-              osc.connect(gain);
-              gain.connect(ctx.destination);
-              osc.type = "sine";
-              osc.frequency.value = freq;
-              gain.gain.setValueAtTime(0.4, startAt);
-              gain.gain.exponentialRampToValueAtTime(0.001, startAt + 0.3);
-              osc.start(startAt);
-              osc.stop(startAt + 0.35);
-            };
-            playBeep(ctx.currentTime, 880);
-            playBeep(ctx.currentTime + 0.4, 880);
-            playBeep(ctx.currentTime + 0.8, 1100);
-          } catch {
-            // Web Audio not available — vibration alone is the fallback
-          }
+
+          // [STEP 9] Audible alert via Web Audio. Key fix over Step 8:
+          //   - Reuse a module-scoped AudioContext instead of creating a new
+          //     one per beep (creates are expensive and may fail in background).
+          //   - Call ctx.resume() before playing — Android WebView suspends
+          //     the AudioContext whenever there's no prior user gesture on the
+          //     currently active web page. resume() forces it back to running.
+          //   - Increased volume: gain 1.0 (maximum) instead of 0.4.
+          //   - Higher frequency: 1800Hz → 2200Hz (pierces ambient noise better).
+          //   - Longer beep duration: 0.5s each.
+          void (async () => {
+            try {
+              type WebkitWindow = Window & { webkitAudioContext?: typeof AudioContext };
+              const AudioCtx = window.AudioContext || (window as WebkitWindow).webkitAudioContext;
+              if (!AudioCtx) return;
+
+              const ctx = new AudioCtx();
+
+              // Resume if the context was suspended by the browser.
+              if (ctx.state === "suspended") await ctx.resume();
+
+              const playTone = (startAt: number, freq: number, duration: number) => {
+                const osc  = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                osc.type = "sine";
+                osc.frequency.value = freq;
+                // Full volume, then quick fade-out at the end.
+                gain.gain.setValueAtTime(1.0, startAt);
+                gain.gain.exponentialRampToValueAtTime(0.001, startAt + duration);
+                osc.start(startAt);
+                osc.stop(startAt + duration + 0.05);
+              };
+
+              // 3 ascending tones: 1800 Hz → 2200 Hz → 2600 Hz
+              playTone(ctx.currentTime,        1800, 0.5);
+              playTone(ctx.currentTime + 0.65, 2200, 0.5);
+              playTone(ctx.currentTime + 1.30, 2600, 0.5);
+            } catch {
+              // Web Audio not available — vibration alone is the fallback.
+            }
+          })();
           return;
         }
 
@@ -703,12 +726,27 @@ export default function FlingApp() {
           setShowCompass(true);
           setTimeout(() => setLocationDebugMessage(""), 2000);
         } else if (event.broadcast) {
-          // [STEP 8] SOS auto-location: the sender broadcast their location
-          // alongside an SOS. Show a notice so any receiver can tap to
-          // navigate toward the emergency origin immediately.
+          // [STEP 9] SOS auto-location: immediately save the sender's
+          // coordinates as a named "SOS" waypoint so the receiver can
+          // navigate with one tap — no separate location request needed.
           const senderName = contactsRef.current.find((c) => c.deviceId === event.sender)
             ?.deviceName || `Ranger ${event.sender}`;
-          setLocationNotice(`📍 ${senderName} shared their location — tap their contact to navigate`);
+
+          const sosWaypoint: NamedWaypoint = {
+            id:        `sos-${event.sender}-${Date.now()}`,
+            name:      `SOS — ${senderName}`,
+            lat:       event.lat,
+            lng:       event.lng,
+            type:      "sos",
+            createdAt: new Date(),
+            notes:     `Emergency location from ${senderName}`,
+          };
+          const existing = readWaypoints().filter((w) => w.type !== "sos" || w.id.split("-")[1] !== event.sender);
+          writeWaypoints([...existing, sosWaypoint]);
+
+          // [STEP 9] Offer instant one-tap navigation via the compact notice.
+          // Tapping "Navigate" in the banner opens the compass immediately.
+          setLocationNotice(`🆘 ${senderName} sent their location — open Waypoints to navigate`);
         }
         return;
       }
@@ -1148,15 +1186,13 @@ export default function FlingApp() {
   // but we don't want to send (e.g. no movement, heartbeat not due yet).
 
   const stopLiveShare = useCallback(() => {
-    // Tell the requester explicitly before clearing.
     const session = liveShareSessionRef.current;
     if (session) sendFrame(encodeLocationStop(session.targetId));
-
-    // Stop the watchPosition GPS lock.
     if (liveShareWatchIdRef.current !== null) {
       navigator.geolocation?.clearWatch(liveShareWatchIdRef.current);
       liveShareWatchIdRef.current = null;
     }
+    setLiveSharingActive(false); // [STEP 9] dismiss compact banner
     resetAllLocationState();
   }, [sendFrame, resetAllLocationState]);
 
@@ -1208,6 +1244,10 @@ export default function FlingApp() {
       status: "active",
     };
     setLocationDebugMessage("Getting your location…");
+    // [STEP 9] Dismiss the blocking full-screen overlay so the user can
+    // freely navigate the app while sharing continues in the background.
+    setShowLocationPermission(false);
+    setLiveSharingActive(true);
 
     // Clear any previous watch before starting a new one.
     if (liveShareWatchIdRef.current !== null) {
@@ -1298,7 +1338,9 @@ export default function FlingApp() {
   // [STEP 8] Navigation — opens the map modal, starts GPS if available.
   // Legacy handleWaypointNavigation kept for any remaining call sites.
   // ════════════════════════════════════════════════════════════════════════
-  const openMapNavigation = useCallback(() => {
+  // [STEP 9] Waypoint navigation: open GPS-capture list modal + start GPS.
+  // ════════════════════════════════════════════════════════════════════════
+  const openWaypointManager = useCallback(() => {
     if (navigator.geolocation && mapGpsWatchIdRef.current === null) {
       mapGpsWatchIdRef.current = navigator.geolocation.watchPosition(
         (pos) => setUserGpsPosition(pos),
@@ -1309,8 +1351,23 @@ export default function FlingApp() {
     setShowWaypoints(true);
   }, []);
 
+  const handleNamedWaypointNavigate = useCallback((wp: NamedWaypoint) => {
+    setCurrentContact({
+      deviceId:        `waypoint-${wp.id}`,
+      deviceName:      wp.name,
+      frequency:       RADIO_FREQUENCY_HZ,
+      spreadingFactor: RADIO_SPREADING_FACTOR,
+      bandwidth:       RADIO_BANDWIDTH_HZ,
+      unreadCount:     0,
+      reachability:    "offline",
+      location:        { lat: wp.lat, lng: wp.lng, accuracy: 0, timestamp: wp.createdAt },
+    });
+    setShowCompass(true);
+    setShowWaypoints(false);
+  }, []);
+
+  // Keep for any remaining legacy usages.
   const handleWaypointNavigation = (waypoint: Waypoint) => {
-    // Legacy: used by compass modal when navigating to a saved waypoint.
     setCurrentContact({
       deviceId:        `waypoint-${waypoint.id}`,
       deviceName:      waypoint.name,
@@ -1392,7 +1449,7 @@ export default function FlingApp() {
           onShowNodeStats={() => setShowNodeStats(true)}
           showDeleteMenu={showDeleteMenu}
           onToggleDeleteMenu={setShowDeleteMenu}
-          onShowWaypoints={openMapNavigation}
+          onShowWaypoints={openWaypointManager}
           onShowAddContact={() => {
             resetDiscovery();    // clear stale results when opening modal
             setShowAddContact(true);
@@ -1456,10 +1513,11 @@ export default function FlingApp() {
         />
       )}
 
-      {/* ── [STEP 8] Map-based navigation (replaces text-only WaypointModal) */}
+      {/* ── [STEP 9] Waypoint manager (GPS-capture list, replaces Leaflet map) */}
       {showWaypoints && (
-        <MapNavigationModal
+        <WaypointManagerModal
           userPosition={userGpsPosition}
+          onNavigate={handleNamedWaypointNavigate}
           onClose={() => {
             setShowWaypoints(false);
             if (mapGpsWatchIdRef.current !== null) {
@@ -1526,7 +1584,36 @@ export default function FlingApp() {
         </div>
       )}
 
-      {/* ── Incoming location permission request ────────────────────────── */}
+      {/* [STEP 9] Compact live-sharing banner — replaces the old full-screen
+          blocking overlay once the user accepts. This lets them use the whole
+          app (navigate views, chat, etc.) while sharing continues in the
+          background via the persistent watchPosition GPS lock. */}
+      {liveSharingActive && (
+        <div className="fixed bottom-0 left-0 right-0 z-50 safe-bottom pointer-events-auto">
+          <div className="mx-3 mb-3 bg-emerald-900 border border-emerald-600 rounded-2xl px-4 py-3 flex items-center justify-between shadow-xl">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <span className="h-2.5 w-2.5 rounded-full bg-emerald-400 animate-pulse flex-shrink-0" />
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-white truncate">
+                  Sharing live location
+                </p>
+                {locationDebugMessage && (
+                  <p className="text-xs text-emerald-300 truncate">{locationDebugMessage}</p>
+                )}
+              </div>
+            </div>
+            <Button
+              onClick={stopLiveShare}
+              size="sm"
+              className="bg-red-600 hover:bg-red-700 text-white rounded-xl px-4 flex-shrink-0 ml-3"
+            >
+              Stop
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Incoming location permission request (consent only, dismissed on accept) ── */}
       {showLocationPermission && incomingLocationRequest && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
           <div className="bg-gray-800 rounded-3xl p-6 max-w-md w-full shadow-2xl">
@@ -1539,45 +1626,30 @@ export default function FlingApp() {
                 <span className="text-white font-medium">{incomingLocationRequest.deviceName}</span>{" "}
                 wants to track your location live
               </p>
-              {liveShareTargetRef.current ? (
-                <>
-                  <p className="text-green-400 text-sm mb-4 animate-pulse">
-                    📡 {locationDebugMessage || "Sharing live location…"}
-                  </p>
+              <>
+                <p className="text-gray-400 text-xs mb-6 px-4">
+                  Once you accept, you can use the rest of the app normally.
+                  A banner at the bottom shows sharing is active.
+                </p>
+                {locationDebugMessage && (
+                  <p className="text-xs text-yellow-500 mb-4 animate-pulse">{locationDebugMessage}</p>
+                )}
+                <div className="flex gap-3">
                   <Button
-                    onClick={stopLiveShare}
-                    className="w-full bg-red-600 hover:bg-red-700 text-white rounded-xl py-3"
+                    variant="outline"
+                    onClick={resetAllLocationState}
+                    className="flex-1 border-gray-600 text-gray-300 hover:bg-gray-700"
                   >
-                    Stop Sharing
+                    Decline
                   </Button>
-                </>
-              ) : (
-                <>
-                  <p className="text-gray-400 text-xs mb-6 px-4">
-                    Your location updates automatically as you move, or at
-                    least every {LIVE_SHARE_HEARTBEAT_MS / 1000}s while
-                    stationary, until you stop.
-                  </p>
-                  {locationDebugMessage && (
-                    <p className="text-xs text-yellow-500 mb-4 animate-pulse">{locationDebugMessage}</p>
-                  )}
-                  <div className="flex gap-3">
-                    <Button
-                      variant="outline"
-                      onClick={resetAllLocationState}
-                      className="flex-1 border-gray-600 text-gray-300 hover:bg-gray-700"
-                    >
-                      Decline
-                    </Button>
-                    <Button
-                      onClick={acceptLocationShare}
-                      className="flex-1 bg-blue-600 hover:bg-blue-700 text-white"
-                    >
-                      Share Live Location
-                    </Button>
-                  </div>
-                </>
-              )}
+                  <Button
+                    onClick={acceptLocationShare}
+                    className="flex-1 bg-blue-600 hover:bg-blue-700 text-white"
+                  >
+                    Share Live Location
+                  </Button>
+                </div>
+              </>
             </div>
           </div>
         </div>

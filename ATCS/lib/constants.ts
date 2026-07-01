@@ -78,7 +78,10 @@ export const EMERGENCY_BROADCAST_ID = "*";
 
 // ── Local storage keys ────────────────────────────────────────────────────────
 export const TRAILS_STORAGE_KEY   = "fling-trails";
-export const CONTACTS_STORAGE_KEY = "fling-contacts";
+export const CONTACTS_STORAGE_KEY  = "fling-contacts";
+// [STEP 9] Flat list of named waypoints (GPS coordinates + label) for the
+// redesigned navigation system. Separate key from trails to keep them simple.
+export const WAYPOINTS_STORAGE_KEY = "fling-waypoints";
 // [NEW] Persist conversation threads (especially the Emergency thread) so the
 // emergency history survives a page reload / app restart. Previously messages
 // lived only in React state and were lost on refresh.

@@ -85,6 +85,7 @@ export function CompassModal({ contact, onBeep, onClose }: CompassModalProps) {
     direction,
     hasSupport: hasDeviceOrientationSupport,
     requestPermission: requestCompassPermission,
+    isAbsolute: compassIsAbsolute,
   } = useDeviceOrientation({ userPosition });
 
   // [FIX 2] needleAngle is the angle the on-screen arrow should be rotated.
@@ -474,7 +475,14 @@ export function CompassModal({ contact, onBeep, onClose }: CompassModalProps) {
             {!userPosition && <p>Getting GPS location…</p>}
             {!direction && userPosition && <p>Accessing compass…</p>}
             {direction && (
-              <p>Heading: {direction.degrees.toFixed(0)}° {direction.cardinal}</p>
+              <p>
+                Heading: {direction.degrees.toFixed(0)}° {direction.cardinal}
+                {/* [STEP 9] Show calibration status: green=absolute (magnetic north),
+                    amber=relative (arbitrary reference, less accurate) */}
+                <span className={`ml-2 ${compassIsAbsolute ? "text-emerald-400" : "text-amber-400"}`}>
+                  {compassIsAbsolute ? "● calibrated" : "● uncalibrated — move phone in a figure-8"}
+                </span>
+              </p>
             )}
             {absoluteBearing !== null && (
               <p>Target bearing: {Math.round(absoluteBearing)}°</p>

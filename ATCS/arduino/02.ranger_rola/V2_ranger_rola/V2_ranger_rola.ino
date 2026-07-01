@@ -144,8 +144,8 @@
 // be different on every physical node and MUST be 8 characters or
 // fewer (NODE_ID_LEN below) so it fits the fixed-size header field.
 // ════════════════════════════════════════════════════════════════════════
-#define THIS_DEVICE_ID  "Node4"          // ← Change per node (max 8 chars)
-#define WIFI_SSID       "ATCS_Node4"    // ← Must match THIS_DEVICE_ID suffix
+#define THIS_DEVICE_ID  "Node1"          // ← Change per node (max 8 chars)
+#define WIFI_SSID       "ATCS-node 1"    // ← Must match THIS_DEVICE_ID suffix
 #define WIFI_PASS       "atcs1234"
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1163,12 +1163,28 @@ void handleReceivedPacket(const uint8_t* buf, int len, int16_t rssi, float snr) 
       // for the requester, exactly like RREQ.
       addOrUpdateRoute(h.src, h.prevHop, h.hop);
 
-      // [STEP 8] battery removed from reply (1 byte: hop count only)
       MeshHeader reply = makeHeader(PKT_DISCOVER_REPLY, h.src, PRIO_CONTROL, 1);
       uint8_t replyPayload[1] = { (uint8_t)(h.hop + 1) };
       forwardUnicast(reply, replyPayload);
 
-      if (h.ttl > 0) forwardPacket(h, payload, true);
+      // [STEP 9] Packet optimisation: only re-flood the DISCOVER if the
+      // requester is NOT already a direct LoRa neighbor of ours.
+      // Reasoning: if Node A can hear Node B directly (they're neighbors),
+      // Node B re-flooding Node A's DISCOVER is pointless — any node that
+      // could have heard Node B's re-flood can already hear Node A directly.
+      // In a 2-node mesh this eliminates ALL DISCOVER re-floods (~540 per
+      // 54-minute continuous-scan session). In a larger mesh we only skip
+      // re-flooding toward nodes that are already fully reachable.
+      bool requesterIsDirectNeighbor = false;
+      for (int i = 0; i < MAX_NEIGHBORS; i++) {
+        if (neighbors[i].inUse && strcmp(neighbors[i].id, h.src) == 0) {
+          requesterIsDirectNeighbor = true;
+          break;
+        }
+      }
+      if (!requesterIsDirectNeighbor && h.ttl > 0) {
+        forwardPacket(h, payload, true);
+      }
       break;
     }
 

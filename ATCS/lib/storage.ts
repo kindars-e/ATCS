@@ -5,7 +5,7 @@
 // writes the same keys.  The data survives page reloads.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { CONTACTS_STORAGE_KEY, MESSAGES_STORAGE_KEY, TRAILS_STORAGE_KEY } from "./constants";
+import { CONTACTS_STORAGE_KEY, MESSAGES_STORAGE_KEY, TRAILS_STORAGE_KEY, WAYPOINTS_STORAGE_KEY } from "./constants";
 import type { Contact, Message } from "./types";
 import type { Trail } from "./types";
 
@@ -112,4 +112,37 @@ export function writeMessages(messages: Record<string, Message[]>): void {
     // localStorage can throw if the quota is exceeded — fail quietly so a full
     // disk never crashes the emergency UI. The in-memory state still works.
   }
+}
+
+// ── [STEP 9] Named Waypoints ──────────────────────────────────────────────────
+// A flat list of named GPS locations for the redesigned navigation system.
+// Each waypoint is a saved coordinate with a name and optional type tag.
+
+export interface NamedWaypoint {
+  id: string;
+  name: string;
+  lat: number;
+  lng: number;
+  type: "waypoint" | "camp" | "water" | "danger" | "sos" | "interest";
+  createdAt: Date;
+  notes?: string;
+}
+
+export function readWaypoints(): NamedWaypoint[] {
+  if (typeof window === "undefined") return [];
+  const raw = window.localStorage.getItem(WAYPOINTS_STORAGE_KEY);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as NamedWaypoint[];
+    return parsed.map((w) => ({ ...w, createdAt: new Date(w.createdAt) }));
+  } catch {
+    return [];
+  }
+}
+
+export function writeWaypoints(waypoints: NamedWaypoint[]): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(WAYPOINTS_STORAGE_KEY, JSON.stringify(waypoints));
+  } catch { /* quota exceeded — fail quietly */ }
 }
