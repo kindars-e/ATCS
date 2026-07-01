@@ -59,7 +59,11 @@ export type RangerEvent =
   | { kind: "location-request";   sender: string }
   // [STEP 6] broadcast: true when this arrived via the automatic SOS
   // location ping rather than a normal 1:1 share/live-share update.
-  | { kind: "location-response";  sender: string; lat: number; lng: number; accuracy: number; broadcast: boolean }
+  // [STEP 7] rssi/snr added: these are available in the underlying "message"
+  // WS frame and should be forwarded so recordNodeHeard() can update signal
+  // quality when a location fix arrives — previously location responses
+  // never refreshed the RSSI display because rssi wasn't threaded through.
+  | { kind: "location-response";  sender: string; lat: number; lng: number; accuracy: number; broadcast: boolean; rssi?: number; snr?: number }
   // [STEP 6] Live-share session explicitly ended by the responder.
   | { kind: "location-stop";      sender: string }
   | { kind: "frequency-update";   frequency: number }
@@ -314,6 +318,11 @@ export function useRangerConnection({
               lng:       decoded.lng,
               accuracy:  decoded.accuracy,
               broadcast: decoded.broadcast, // [STEP 6]
+              // [STEP 7] Forward the RSSI/SNR from the outer WS frame so
+              // recordNodeHeard() can update signal quality on location-
+              // response events, not only on text messages.
+              rssi,
+              snr,
             });
 
           } else if (decoded.kind === "location-stop") {
@@ -354,8 +363,12 @@ export function useRangerConnection({
 
         // [STEP 4B] Periodic firmware health/diagnostics counters.
         case "stats": {
+          // [STEP 7] Field names updated to match the corrected firmware:
+          //   pktSent    — total LoRa packets (all types, not just messages)
+          //   appMsgSent — user-initiated messages only
           setNodeStats({
-            messagesSent:        (frame.messagesSent        as number) ?? 0,
+            pktSent:             (frame.pktSent             as number) ?? 0,
+            appMsgSent:          (frame.appMsgSent           as number) ?? 0,
             messagesReceived:    (frame.messagesReceived    as number) ?? 0,
             uptime:              (frame.uptime              as number) ?? 0,
             connectedClients:    (frame.connectedClients    as number) ?? 0,

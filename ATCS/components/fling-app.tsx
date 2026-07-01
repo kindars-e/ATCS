@@ -57,6 +57,7 @@ import {
   RSSI_WEAK_DBM,
   SOS_LOCATION_DEBOUNCE_MS,
   SPLASH_DURATION_MS,
+  ACK_RETRY_VISUAL_DELAY_MS,
 } from "@/lib/constants";
 import {
   encodeBeep,
@@ -202,8 +203,12 @@ export default function FlingApp() {
   const [discoveredNodes, setDiscoveredNodes] = useState<DiscoveredNode[]>([]);
   const discoveryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const lastSentIdRef  = useRef<Record<string, string>>({});
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const lastSentIdRef   = useRef<Record<string, string>>({});
+  // [STEP 7] Tracks per-message timers that flip "sent" → "retrying" after
+  // ACK_RETRY_VISUAL_DELAY_MS without a delivery-confirmed event. Keyed by
+  // message id; cleared on delivery-confirmed or delivery-failed.
+  const retryTimerRef   = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const messagesEndRef  = useRef<HTMLDivElement>(null);
   const myDeviceIdRef  = useRef("");
   const myDeviceNameRef = useRef(""); // [NEW] our firmware display name for pair requests
   // [NEW] A live mirror of the contacts list so the (stable) Ranger event
@@ -629,7 +634,9 @@ export default function FlingApp() {
       // location ping (event.broadcast) — either way, a fresh fix for
       // event.sender is real and worth storing.
       case "location-response": {
-        recordNodeHeard(event.sender); // [v6] a reply proves reachability
+        // [STEP 7] Forward rssi/snr so signal quality is updated on every
+        // location fix received, not only on text messages.
+        recordNodeHeard(event.sender, event.rssi, event.snr);
         const newLocation: ContactLocation = {
           lat:       event.lat,
           lng:       event.lng,
@@ -675,6 +682,12 @@ export default function FlingApp() {
           if (!prev) return prev;
           const lastId = lastSentIdRef.current[prev.deviceId];
           if (lastId) {
+            // [STEP 7] Cancel the "retrying" visual timer — the message was
+            // delivered, so we never need to flip it to "retrying" state.
+            if (retryTimerRef.current[lastId]) {
+              clearTimeout(retryTimerRef.current[lastId]);
+              delete retryTimerRef.current[lastId];
+            }
             setMessages((msgs) => ({
               ...msgs,
               [prev.deviceId]: (msgs[prev.deviceId] || []).map((m) =>
@@ -697,6 +710,12 @@ export default function FlingApp() {
         if (dest) {
           const lastId = lastSentIdRef.current[dest];
           if (lastId) {
+            // [STEP 7] Cancel the retry visual — we now have a definitive
+            // "failed" from the firmware (all retries + route recovery done).
+            if (retryTimerRef.current[lastId]) {
+              clearTimeout(retryTimerRef.current[lastId]);
+              delete retryTimerRef.current[lastId];
+            }
             setMessages((msgs) => ({
               ...msgs,
               [dest]: (msgs[dest] || []).map((m) =>
@@ -962,12 +981,29 @@ export default function FlingApp() {
 
     if (sent) {
       lastSentIdRef.current[currentContact.deviceId] = msgId;
+      const contactId = currentContact.deviceId;
       setMessages((prev) => ({
         ...prev,
-        [currentContact.deviceId]: (prev[currentContact.deviceId] || []).map((m) =>
+        [contactId]: (prev[contactId] || []).map((m) =>
           m.id === msgId ? { ...m, status: "sent" as const } : m,
         ),
       }));
+
+      // [STEP 7] After ACK_RETRY_VISUAL_DELAY_MS without a delivery-confirmed
+      // event, flip "sent" → "retrying" so the user can see the mesh is
+      // actively re-sending rather than silently hanging. Broadcasts ("*")
+      // never get ACKs, so skip the timer for them.
+      if (!isEmergencyThread) {
+        retryTimerRef.current[msgId] = setTimeout(() => {
+          setMessages((prev) => ({
+            ...prev,
+            [contactId]: (prev[contactId] || []).map((m) =>
+              m.id === msgId && m.status === "sent" ? { ...m, status: "retrying" as const } : m,
+            ),
+          }));
+          delete retryTimerRef.current[msgId];
+        }, ACK_RETRY_VISUAL_DELAY_MS);
+      }
     } else if ("serviceWorker" in navigator && navigator.serviceWorker.controller) {
       navigator.serviceWorker.controller.postMessage({
         type:    "QUEUE_OFFLINE_MESSAGE",
@@ -1073,11 +1109,12 @@ export default function FlingApp() {
         (pos) => {
           const { latitude, longitude, accuracy } = pos.coords;
 
-          // [STEP 6] GPS accuracy validation — a fix this poor won't
-          // actually help anyone find this person; hold it back and wait
-          // for a better one instead of burning airtime on it.
-          if (accuracy > MAX_USEFUL_GPS_ACCURACY_M) {
-            setLocationDebugMessage(`Waiting for a better GPS fix (±${Math.round(accuracy)}m)…`);
+          // [STEP 7] First send always goes through regardless of accuracy —
+          // the requester needs SOME location immediately even if the GPS
+          // hasn't fully acquired yet. Subsequent updates apply the accuracy
+          // gate so we don't spam poor fixes during continuous sharing.
+          if (!isFirstSend && accuracy > MAX_USEFUL_GPS_ACCURACY_M) {
+            setLocationDebugMessage(`Waiting for better GPS (±${Math.round(accuracy)}m)…`);
             return;
           }
 
@@ -1105,12 +1142,17 @@ export default function FlingApp() {
         (err) => {
           if (err.code === err.PERMISSION_DENIED) {
             setLocationDebugMessage("Location permission denied. Enable in device settings.");
-            stopLiveShare();
+            stopLiveShare(); // can't recover — user explicitly denied
           } else {
-            setLocationDebugMessage("GPS error — retrying…");
+            // [STEP 7] TIMEOUT or POSITION_UNAVAILABLE are transient — do NOT
+            // stop the session, just note it and try again on the next tick.
+            setLocationDebugMessage("GPS error — retrying on next update…");
           }
         },
-        { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 },
+        // [STEP 7] First send: allow a 30-second cached position for instant
+        // response (avoids the full GPS cold-start delay on first location
+        // share). Subsequent sends always use a fresh fix (maximumAge: 0).
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: isFirstSend ? 30000 : 0 },
       );
     },
     [sendFrame, stopLiveShare],

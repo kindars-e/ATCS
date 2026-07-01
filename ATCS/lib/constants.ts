@@ -49,11 +49,21 @@ export const RSSI_WEAK_DBM   = -100; // below this = weak signal
 // rather than presented as if it were current.
 export const SIGNAL_SAMPLE_STALE_MS = 60_000; // 60 s
 
-// ── [STEP 4A] Reachability — time-only, never influenced by signal strength ──
+// ── [STEP 4A / STEP 7] Reachability — time-only, never influenced by signal ──
 // Silence is the strongest sign a node left range. Any received packet
 // (message/discovery/location/relayed HELLO) resets a node's clock.
-export const NODE_STALE_MS   = 30_000;   // 30 s quiet → "stale"
-export const NODE_OFFLINE_MS = 90_000;   // 90 s quiet → "offline"
+//
+// [STEP 7] Timing recalibrated relative to HELLO_INTERVAL_MS (15 s):
+//   NODE_STALE_MS  = 22 s  → goes stale after roughly 1.5 HELLO intervals.
+//     A single slightly-late HELLO (up to 22 s) won't cause false "Stale",
+//     but a genuinely missing HELLO does — giving fast, stable feedback.
+//   NODE_OFFLINE_MS = 45 s → "offline" after ~3 missed HELLOs. Clearly
+//     dead, not a transient RF hiccup.
+//
+// Previous values (30 s / 90 s) were too slow for field use: a node that
+// was just powered off would appear "online" for up to 30 s.
+export const NODE_STALE_MS   = 22_000;   // 22 s quiet → "stale"
+export const NODE_OFFLINE_MS = 45_000;   // 45 s quiet → "offline"
 
 // How often the app re-evaluates every node's status (ms). A steady tick is
 // what makes statuses update dynamically without the user doing anything.
@@ -116,9 +126,15 @@ export const MAX_USEFUL_GPS_ACCURACY_M = 200;
 //     still gets periodic proof the share is alive even while stationary).
 // LIVE_SHARE_CHECK_INTERVAL_MS is just how often we re-evaluate those two
 // conditions — not how often we transmit.
-export const MIN_LOCATION_MOVE_M        = 15;
-export const LIVE_SHARE_HEARTBEAT_MS    = 30_000;
-export const LIVE_SHARE_CHECK_INTERVAL_MS = 5_000;
+// [STEP 7] Thresholds tuned for real-world testing and demonstrations.
+// Old values (15 m / 30 s / 5 s) caused no visible updates when walking
+// slowly or in a small area. New values make location feel near-real-time:
+//   2 m movement threshold — triggers a send for any noticeable step
+//   10 s heartbeat  — requester sees a fresh fix at least every 10 s
+//   2 s check interval — evaluates movement every 2 s for quick response
+export const MIN_LOCATION_MOVE_M          = 2;
+export const LIVE_SHARE_HEARTBEAT_MS      = 10_000;
+export const LIVE_SHARE_CHECK_INTERVAL_MS = 2_000;
 
 // How long to wait for a location-request to be answered before giving up
 // and showing an error instead of spinning forever.
@@ -134,3 +150,9 @@ export const LOCATION_LOST_MS  = 120_000;
 // resends the same SOS 3x (with jitter) for RF resilience; this prevents us
 // from firing a redundant GPS broadcast for each of those repeats.
 export const SOS_LOCATION_DEBOUNCE_MS = 8_000;
+
+// [STEP 7] How long a message stays "sent" before the UI assumes the
+// firmware is retrying and shows a "Retrying…" state. Set just above
+// the firmware's new ACK_TIMEOUT_MS (3 s) so the visual flip happens
+// right after the first retry starts, not before.
+export const ACK_RETRY_VISUAL_DELAY_MS = 3_500;

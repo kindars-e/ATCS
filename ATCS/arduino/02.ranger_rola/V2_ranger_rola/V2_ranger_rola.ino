@@ -205,7 +205,11 @@
 #define ROUTE_DISCOVERY_TIMEOUT_MS  6000   // total budget across all RREQ attempts
 #define MAX_RREQ_ATTEMPTS              2     // 1 initial + 1 controlled retry (bounded — never loops)
 #define RREQ_RETRY_INTERVAL_MS      3000   // resend once if no RREP within this long
-#define ACK_TIMEOUT_MS           1500   // how long to wait for an end-to-end ACK
+// [STEP 7] Increased from 1500 → 3000 ms: a 3-hop ACK round-trip on a
+// loaded mesh with jitter can take 300-800 ms; 1500 ms was too tight and
+// caused premature retries that added congestion. 3 retries × 3 s = 9 s
+// before route-recovery kicks in (Step 4A), which is still timely.
+#define ACK_TIMEOUT_MS           3000   // how long to wait for an end-to-end ACK
 #define MAX_SEND_RETRIES            3     // unicast resend attempts before giving up
 #define SEEN_CACHE_EXPIRY_MS    30000   // forget old dedup entries
 
@@ -552,10 +556,20 @@ void ledUpdate() {
 // ════════════════════════════════════════════════════════════════════════
 
 WebSocketsServer webSocket = WebSocketsServer(8765);
-StaticJsonDocument<512> doc;
+// [STEP 7] Increased from 512 → 1024: the stats frame now carries 11
+// fields; at the old size, the last field ("battery") could be silently
+// dropped by ArduinoJson when the internal pool fills up, making battery
+// always appear as "Unknown" in the app's Node Diagnostics panel.
+StaticJsonDocument<1024> doc;
 
 uint8_t       connectedClients   = 0;
-unsigned int  msgSent            = 0;
+// [STEP 7] pktSent counts every LoRa packet that left the radio queue
+// (HELLO beacons, ACKs, RREQs, data, forwards — everything). This is
+// what the old "messagesSent" label tracked, which was misleading.
+// appMsgSent counts only user-initiated application messages (chat,
+// beep, location) — what users actually think of as "messages sent."
+unsigned int  pktSent            = 0;
+unsigned int  appMsgSent         = 0;
 unsigned int  msgReceived        = 0;
 unsigned int  pktForwarded       = 0;
 unsigned int  pktDroppedDup      = 0;
@@ -778,7 +792,7 @@ void drainOutQueue() {
   LoRa.beginPacket();
   LoRa.write(outQueue[best].buf, outQueue[best].len);
   LoRa.endPacket();
-  msgSent++;
+  pktSent++; // [STEP 7] renamed from msgSent — this counts ALL packets
 
   digitalWrite(LED_YELLOW, HIGH); delay(20); digitalWrite(LED_YELLOW, LOW);
 
@@ -1023,6 +1037,11 @@ void flushPendingRouteFor(const char* dest) {
 void sendAppMessage(const char* recipient, const char* data) {
   uint8_t payloadLen = (uint8_t)strlen(data);
   if (payloadLen > MAX_PAYLOAD) payloadLen = MAX_PAYLOAD;
+
+  // [STEP 7] Count user-originated application messages separately from all
+  // the low-level protocol traffic (HELLOs, ACKs, RREQs, etc.) that the
+  // old "messagesSent" counter was silently including.
+  appMsgSent++;
 
   bool broadcast = isBroadcastAddr(recipient);
   uint8_t priority = broadcast ? PRIO_SOS : PRIO_NORMAL;
@@ -1523,11 +1542,16 @@ void loop() {
     lastStats = now;
     doc.clear();
     doc["type"]             = "stats";
-    doc["messagesSent"]     = msgSent;
+    // [STEP 7] pktSent = ALL LoRa transmissions (HELLOs, ACKs, RREQs …).
+    // appMsgSent = user-originated data messages only (what the old
+    // "messagesSent" label incorrectly implied). Both are now exposed so
+    // the diagnostics panel can show accurate, honest numbers.
+    doc["pktSent"]          = pktSent;
+    doc["appMsgSent"]       = appMsgSent;
     doc["messagesReceived"] = msgReceived;
     doc["uptime"]           = now / 1000;
     doc["connectedClients"] = connectedClients;
-    doc["pktForwarded"]     = pktForwarded;       // additive mesh diagnostics
+    doc["pktForwarded"]     = pktForwarded;
     doc["pktDroppedDup"]    = pktDroppedDup;
     doc["pktDroppedNoRoute"]= pktDroppedNoRoute;
     doc["routeDiscoveries"] = routeDiscoveries;

@@ -36,8 +36,13 @@ export type Contact = {
 // [STEP 4B] Periodic firmware health/diagnostics counters, surfaced as-is
 // from the firmware's "stats" WS frame (sent every 5s while a phone is
 // connected). Purely informational — nothing in the app logic depends on it.
+// [STEP 7] NodeStats updated to match the corrected firmware field names.
+//   pktSent      = total LoRa packets sent (HELLOs, ACKs, RREQs, data …)
+//   appMsgSent   = only user-originated messages (chat, beep, location)
+// The old "messagesSent" field was pktSent under a misleading name.
 export type NodeStats = {
-  messagesSent: number;
+  pktSent: number;       // all LoRa transmissions (renamed from messagesSent)
+  appMsgSent: number;    // user messages only
   messagesReceived: number;
   uptime: number; // seconds since the node booted
   connectedClients: number;
@@ -87,7 +92,12 @@ export type Message = {
   broadcast?: boolean;
 };
 
-export type MessageStatus = "sending" | "sent" | "delivered" | "read" | "failed";
+// [STEP 7] "retrying" added: shown after ACK_RETRY_VISUAL_DELAY_MS of
+// being in "sent" state without a delivery confirmation, so the user can
+// see the mesh is actively re-sending rather than silently hanging. The
+// message stays "retrying" until a delivery-confirmed or delivery-failed
+// event arrives from the firmware.
+export type MessageStatus = "sending" | "sent" | "retrying" | "delivered" | "read" | "failed";
 
 export type View = "contacts" | "chat";
 

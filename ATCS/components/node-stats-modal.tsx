@@ -85,10 +85,15 @@ export function NodeStatsModal({
               <Radio className="h-3.5 w-3.5" /> Mesh diagnostics (live, updates every ~5s)
             </p>
             <Row label="Uptime" value={formatUptime(stats.uptime)} />
-            <Row label="Messages sent" value={stats.messagesSent} />
-            <Row label="Messages received" value={stats.messagesReceived} />
+            {/* [STEP 7] "Messages sent" was renamed to "All packets sent (LoRa)"
+                because the old counter included every HELLO beacon, ACK, RREQ,
+                and relay forward — not just user-sent chat messages. The real
+                user-message count is now tracked separately as appMsgSent. */}
+            <Row label="User messages sent" value={stats.appMsgSent} />
+            <Row label="All LoRa packets sent" value={stats.pktSent} />
+            <Row label="Data messages received" value={stats.messagesReceived} />
             <Row label="Connected phones" value={stats.connectedClients} />
-            <Row label="Packets forwarded (relayed)" value={stats.pktForwarded} />
+            <Row label="Packets forwarded (relay)" value={stats.pktForwarded} />
             <Row label="Dropped — duplicate" value={stats.pktDroppedDup} />
             <Row label="Dropped — no route" value={stats.pktDroppedNoRoute} />
             <Row label="Dropped — queue full" value={stats.pktDroppedQueueFull} />

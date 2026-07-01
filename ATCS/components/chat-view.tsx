@@ -228,8 +228,12 @@ export function ChatView({
                       isSelected ? "ring-2 ring-blue-400" : ""
                     } ${
                       message.isMe
+                        // [STEP 7] "retrying" uses amber instead of red —
+                        // it's not a failure, just an in-progress mesh retry.
                         ? message.status === "failed"
                           ? "bg-red-500 text-white"
+                          : message.status === "retrying"
+                          ? "bg-amber-700 text-white"
                           : isEmergency
                             ? "bg-gradient-to-r from-orange-600 to-red-600 text-white border border-red-500/50"
                             : "bg-blue-600 text-white"
@@ -267,6 +271,17 @@ export function ChatView({
                           )}
                           {message.status === "sent" && (
                             <Check className="w-4 h-4" />
+                          )}
+                          {/* [STEP 7] Retrying: shown when the mesh hasn't
+                              ACK'd the message yet and the firmware is
+                              actively re-sending. Amber spinner so it's
+                              visually distinct from both "sending" (white)
+                              and "failed" (red background). */}
+                          {message.status === "retrying" && (
+                            <div className="flex items-center gap-1">
+                              <div className="w-3 h-3 rounded-full border-2 border-amber-400 animate-spin" />
+                              <span className="text-xs text-amber-400">Retrying</span>
+                            </div>
                           )}
                           {message.status === "delivered" && (
                             <CheckCheck className="w-4 h-4" />

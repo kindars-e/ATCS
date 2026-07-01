@@ -47,4 +47,16 @@
          throws a SecurityException without this permission. It's a "normal" (not dangerous)
          permission — granted automatically at install time, no runtime prompt needed. -->
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+
+    <!-- [STEP 7] Location permissions required for GPS/live-location sharing.
+         Without these declared in the manifest the app simply does not appear
+         in Android's Location Permission settings and navigator.geolocation
+         immediately returns PERMISSION_DENIED — silently terminating live-share
+         sessions and preventing SOS location broadcasts.
+         ACCESS_FINE_LOCATION allows GPS-level precision.
+         ACCESS_COARSE_LOCATION is required by the Android SDK alongside FINE.
+         Both are "dangerous" permissions that also require a runtime prompt at
+         first use, which the WebView geolocation API triggers automatically. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 </manifest>
