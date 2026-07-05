@@ -35,6 +35,7 @@ import { Button } from "@/components/ui/button";
 import { useMobileKeyboard }    from "@/hooks/use-mobile-keyboard";
 import { usePwaInstall }        from "@/hooks/use-pwa-install";
 import { useActiveTrailCount }  from "@/hooks/use-active-trails";
+import { useBreadcrumbTrail }   from "@/hooks/use-breadcrumb-trail";
 import {
   useRangerConnection,
   type RangerEvent,
@@ -78,12 +79,15 @@ import type {
   ReachabilityStatus,
   SignalQuality,
   View,
-  Waypoint,
 } from "@/lib/types";
 
 import AddDeviceModal, { type DiscoveredNode } from "./add-device-modal";
-// [STEP 9] Replaced the Leaflet map modal with a GPS-capture list approach.
+// [STEP 9] The Leaflet map modal was sidelined for a GPS-capture list
+// approach (no offline basemap existed at the time). [STEP 11] Revived
+// alongside the list view now that it supports an optional offline basemap
+// bundled with the app — see map-navigation-modal.tsx.
 import { WaypointManagerModal } from "./waypoint-manager-modal";
+import MapNavigationModal from "./map-navigation-modal";
 import { readWaypoints, writeWaypoints, type NamedWaypoint } from "@/lib/storage";
 import WiFiConnectionModal from "./wifi-connection-modal";
 import { SplashScreen }    from "./splash-screen";
@@ -140,11 +144,27 @@ export default function FlingApp() {
   ]);
 
   const [showWaypoints,  setShowWaypoints]  = useState(false);
+  // [STEP 11] The offline map — see map-navigation-modal.tsx.
+  const [showMap, setShowMap] = useState(false);
+  // [STEP 12] A specific location to pre-load as the map's destination when
+  // opened from somewhere other than the Waypoints list (e.g. tapping an
+  // SOS notice) — see openMapAt below.
+  const [mapTargetLocation, setMapTargetLocation] = useState<{ lat: number; lng: number; label?: string } | null>(null);
   // [STEP 8] Live user GPS for passing into the map component. We use the
   // raw browser API here (not the hook) to keep this light — the hook's
   // watchPosition is reserved for live-share sessions.
   const [userGpsPosition, setUserGpsPosition] = useState<GeolocationPosition | null>(null);
   const mapGpsWatchIdRef = useRef<number | null>(null);
+  // [STEP 12] Optional tap action for the location-session banner (e.g. "an
+  // SOS location arrived — tap to navigate"). Most locationNotice messages
+  // are plain informational text with no action, so this is a separate ref
+  // rather than changing setLocationNotice's signature everywhere.
+  const locationNoticeActionRef = useRef<(() => void) | null>(null);
+  // [STEP 11] Breadcrumb/trail recording. Owned here (not inside the
+  // Waypoints or Map modals) so a recording in progress keeps running in the
+  // background across those modals opening and closing — they're just views
+  // onto this state, not owners of it.
+  const breadcrumb = useBreadcrumbTrail();
   // [NEW] Messages are now seeded from localStorage so the Emergency thread and
   // private chats survive a page reload. readMessages() returns {} on first run.
   const [messages,       setMessages]       = useState<Record<string, Message[]>>(() => readMessages());
@@ -182,6 +202,13 @@ export default function FlingApp() {
   // [STEP 6] Transient banner for location-session events (e.g. "X stopped
   // sharing their location") — same pattern as rangeNotice/deliveryNotice.
   const [locationNotice, setLocationNotice] = useState<string | null>(null);
+
+  // [STEP 12] SOS mesh-confidence status (item 9). Unlike the other notice
+  // banners (4-5s auto-dismiss), this is deliberately persistent — during an
+  // actual emergency, reassurance that help is being coordinated shouldn't
+  // silently disappear after a few seconds. Dismissed only by the user or by
+  // sending/receiving a new SOS.
+  const [sosStatus, setSosStatus] = useState<{ triggeredAt: number; confirmedBy: string[] } | null>(null);
 
   // [STEP 6] Live-share session state, mutated in place (a ref, not React
   // state) since it's read/written from timer callbacks and geolocation
@@ -231,6 +258,18 @@ export default function FlingApp() {
   // ACK_RETRY_VISUAL_DELAY_MS without a delivery-confirmed event. Keyed by
   // message id; cleared on delivery-confirmed or delivery-failed.
   const retryTimerRef   = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  // [STEP 12] Failed-message auto-recovery. A permanently-failed chat send
+  // (firmware exhausted retries + one rediscovery cycle) is remembered here
+  // instead of just being abandoned — the moment this contact's reachability
+  // flips back to online/stale (see the range-monitor effect below), it's
+  // automatically resent once. Cleared as soon as that one retry fires, so a
+  // rapidly-flapping contact can't trigger a resend loop.
+  const failedRetryRef = useRef<Record<string, { msgId: string; content: string }>>({});
+  // Populated further down (after sendFrame exists) and read from the
+  // range-monitor effect above it — a ref indirection avoids the stale-
+  // closure trap of that effect's empty dependency array ever seeing an
+  // outdated sendFrame/isOnline.
+  const retryFailedMessageRef = useRef<(deviceId: string) => void>(() => {});
   const messagesEndRef  = useRef<HTMLDivElement>(null);
   const myDeviceIdRef  = useRef("");
   const myDeviceNameRef = useRef(""); // [NEW] our firmware display name for pair requests
@@ -298,6 +337,11 @@ export default function FlingApp() {
               setRangeNotice(`${c.deviceName} hasn't been heard from recently`);
             } else if (next === "online" && (before === "offline" || before === "stale")) {
               setRangeNotice(`${c.deviceName} is back online`);
+              // [STEP 12] A route may have just recovered — automatically
+              // retry any message that permanently failed while this
+              // contact was unreachable, instead of leaving it failed
+              // forever until the user notices and resends by hand.
+              retryFailedMessageRef.current(c.deviceId);
             }
           }
           prevStatusRef.current[c.deviceId] = next;
@@ -328,7 +372,10 @@ export default function FlingApp() {
   // [STEP 6] Auto-dismiss the location-session banner.
   useEffect(() => {
     if (!locationNotice) return;
-    const id = setTimeout(() => setLocationNotice(null), 5000);
+    const id = setTimeout(() => {
+      setLocationNotice(null);
+      locationNoticeActionRef.current = null; // [STEP 12] don't leave a stale tap action armed
+    }, 5000);
     return () => clearTimeout(id);
   }, [locationNotice]);
 
@@ -456,6 +503,27 @@ export default function FlingApp() {
       if (!deviceId || deviceId === EMERGENCY_BROADCAST_ID) return;
       const now = new Date();
       const hasSample = rssi !== undefined;
+
+      // [STEP 12] Mesh awareness (item 7): surface a route-change notice —
+      // e.g. a contact that was reached directly is now only reachable via
+      // relay, or vice versa. Read from contactsRef (a snapshot, kept in
+      // sync by its own effect) rather than inside the setContacts updater
+      // below, which must stay a pure function of its previous state.
+      if (hasSample && hopDistance !== undefined) {
+        const existing = contactsRef.current.find((c) => c.deviceId === deviceId);
+        const prevHop = existing?.signalHopDistance;
+        if (prevHop !== undefined && prevHop !== hopDistance) {
+          const name = existing?.deviceName || `Ranger ${deviceId}`;
+          if (prevHop === 0 && hopDistance > 0) {
+            setRangeNotice(`${name} is now reached via relay (${hopDistance} hop${hopDistance > 1 ? "s" : ""})`);
+          } else if (prevHop > 0 && hopDistance === 0) {
+            setRangeNotice(`${name} is now directly reachable`);
+          } else {
+            setRangeNotice(`Route to ${name} changed — now ${hopDistance} hop${hopDistance > 1 ? "s" : ""} away`);
+          }
+        }
+      }
+
       setContacts((prev) =>
         prev.map((c) =>
           c.deviceId === deviceId
@@ -591,6 +659,11 @@ export default function FlingApp() {
           const now = Date.now();
           if (now - lastSosLocationRef.current.at > SOS_LOCATION_DEBOUNCE_MS) {
             lastSosLocationRef.current = { sender: senderId, at: now };
+            // [STEP 12] Start (or restart) the SOS mesh-confidence banner —
+            // gated by the same debounce as the location follow-up above, so
+            // the firmware's 3x SOS resend (same logical event) doesn't reset
+            // the confirmation count three times for one real emergency.
+            setSosStatus({ triggeredAt: now, confirmedBy: [] });
             if (typeof navigator !== "undefined" && navigator.geolocation) {
               navigator.geolocation.getCurrentPosition(
                 (pos) => {
@@ -792,9 +865,21 @@ export default function FlingApp() {
           const existing = readWaypoints().filter((w) => w.type !== "sos" || w.id.split("-")[1] !== event.sender);
           writeWaypoints([...existing, sosWaypoint]);
 
-          // [STEP 9] Offer instant one-tap navigation via the compact notice.
-          // Tapping "Navigate" in the banner opens the compass immediately.
-          setLocationNotice(`🆘 ${senderName} sent their location — open Waypoints to navigate`);
+          // [STEP 12] Tapping the notice now opens the map directly, centred
+          // on the SOS location — the map is the primary visualization for
+          // any shared location, not just something buried in Waypoints.
+          locationNoticeActionRef.current = () => {
+            setMapTargetLocation({ lat: event.lat, lng: event.lng, label: sosWaypoint.name });
+            if (navigator.geolocation && mapGpsWatchIdRef.current === null) {
+              mapGpsWatchIdRef.current = navigator.geolocation.watchPosition(
+                (pos) => setUserGpsPosition(pos),
+                () => {},
+                { enableHighAccuracy: true, maximumAge: 0 },
+              );
+            }
+            setShowMap(true);
+          };
+          setLocationNotice(`🆘 ${senderName} sent their location — tap to navigate`);
         }
         return;
       }
@@ -807,6 +892,7 @@ export default function FlingApp() {
       case "location-stop": {
         const name = contactsRef.current.find((c) => c.deviceId === event.sender)?.deviceName
           || `Ranger ${event.sender}`;
+        locationNoticeActionRef.current = null; // [STEP 12] purely informational, no tap action
         setLocationNotice(`${name} stopped sharing their location`);
         return;
       }
@@ -822,6 +908,8 @@ export default function FlingApp() {
               clearTimeout(retryTimerRef.current[lastId]);
               delete retryTimerRef.current[lastId];
             }
+            // [STEP 12] Delivery succeeded — nothing left to auto-retry.
+            delete failedRetryRef.current[prev.deviceId];
             setMessages((msgs) => ({
               ...msgs,
               [prev.deviceId]: (msgs[prev.deviceId] || []).map((m) =>
@@ -850,12 +938,23 @@ export default function FlingApp() {
               clearTimeout(retryTimerRef.current[lastId]);
               delete retryTimerRef.current[lastId];
             }
-            setMessages((msgs) => ({
-              ...msgs,
-              [dest]: (msgs[dest] || []).map((m) =>
-                m.id === lastId ? { ...m, status: "failed" as const } : m,
-              ),
-            }));
+            setMessages((msgs) => {
+              const thread = msgs[dest] || [];
+              // [STEP 12] Remember this failed send (content + id) so it can
+              // be automatically retried once this contact's reachability
+              // recovers — see retryFailedMessage below and the
+              // offline/stale→online transition in the range-monitor effect.
+              const failedMsg = thread.find((m) => m.id === lastId);
+              if (failedMsg) {
+                failedRetryRef.current[dest] = { msgId: lastId, content: failedMsg.content };
+              }
+              return {
+                ...msgs,
+                [dest]: thread.map((m) =>
+                  m.id === lastId ? { ...m, status: "failed" as const } : m,
+                ),
+              };
+            });
           }
           const name = contactsRef.current.find((c) => c.deviceId === dest)?.deviceName || `Ranger ${dest}`;
           setDeliveryNotice(`Message to ${name} could not be delivered`);
@@ -877,6 +976,13 @@ export default function FlingApp() {
             ),
           }));
         }
+        // [STEP 12] Feed the SOS mesh-confidence banner — every node that
+        // actually received the broadcast reports exactly one of these, so
+        // this is the real, mesh-wide "help is being coordinated" signal.
+        setSosStatus((prev) => {
+          if (!prev || prev.confirmedBy.includes(event.from)) return prev;
+          return { ...prev, confirmedBy: [...prev.confirmedBy, event.from] };
+        });
         return;
       }
 
@@ -1076,6 +1182,45 @@ export default function FlingApp() {
     );
   }, []);
 
+  // [STEP 12] Failed-message auto-recovery. Called from the range-monitor
+  // effect (via retryFailedMessageRef, to dodge that effect's stale-closure
+  // problem) the instant a contact transitions offline/stale → online — a
+  // route may have just recovered, so a message that permanently failed
+  // while unreachable gets exactly one automatic resend instead of staying
+  // failed forever until the user happens to notice and retype it. Only
+  // applies to 1:1 chat: SOS/emergency sends are broadcasts that never reach
+  // a "failed" state to begin with (fire-and-forget flood, no per-recipient
+  // ACK), and location REQUESTS use a separate client-side timeout rather
+  // than this firmware delivery-failed signal (see requestLocation below) —
+  // both are structurally different from a plain unicast chat send.
+  const retryFailedMessage = useCallback((deviceId: string) => {
+    const failed = failedRetryRef.current[deviceId];
+    if (!failed || !isOnline) return;
+    delete failedRetryRef.current[deviceId]; // one automatic retry per failure — never a loop
+
+    const { msgId, content } = failed;
+    setMessages((prev) => ({
+      ...prev,
+      [deviceId]: (prev[deviceId] || []).map((m) =>
+        m.id === msgId ? { ...m, status: "retrying" as const } : m,
+      ),
+    }));
+    setDeliveryNotice(`Route recovered — resending message to ${
+      contactsRef.current.find((c) => c.deviceId === deviceId)?.deviceName || `Ranger ${deviceId}`
+    }`);
+
+    // Reuses the EXACT SAME message id, so the existing "delivery-confirmed"
+    // / "delivery-failed" WS event handlers (which look messages up by
+    // lastSentIdRef) resolve this resend exactly like any other send —
+    // "delivered" if it now goes through, or "failed" again (this time for
+    // good — failedRetryRef was already cleared above, so it won't loop) if
+    // the mesh still can't reach this contact.
+    const sent = sendFrame(encodeTextMessage(deviceId, content));
+    if (sent) lastSentIdRef.current[deviceId] = msgId;
+  }, [isOnline, sendFrame]);
+
+  useEffect(() => { retryFailedMessageRef.current = retryFailedMessage; }, [retryFailedMessage]);
+
   // ════════════════════════════════════════════════════════════════════════
   // MESSAGING
   // Emergency messages send to recipient="*" — the firmware broadcasts them.
@@ -1087,6 +1232,12 @@ export default function FlingApp() {
     // message is an emergency broadcast (recipient "*"). We tag it so the UI
     // renders it with the emergency styling and so persistence keeps the flag.
     const isEmergencyThread = currentContact.deviceId === EMERGENCY_BROADCAST_ID;
+
+    // [STEP 12] A fresh manual send supersedes any earlier failed message to
+    // this contact that was waiting for automatic retry-on-recovery — without
+    // this, a later reachability flip could resend stale, already-superseded
+    // text on top of whatever the user just sent.
+    delete failedRetryRef.current[currentContact.deviceId];
 
     const msgId = Date.now().toString();
     const newMessage: Message = {
@@ -1415,23 +1566,8 @@ export default function FlingApp() {
     setActiveNavContact(navContact); // [Step 9]
     setShowCompass(true);
     setShowWaypoints(false);
+    setShowMap(false); // [STEP 11] also close the map if navigation was triggered from there
   }, []);
-
-  // Keep for any remaining legacy usages.
-  const handleWaypointNavigation = (waypoint: Waypoint) => {
-    setCurrentContact({
-      deviceId:        `waypoint-${waypoint.id}`,
-      deviceName:      waypoint.name,
-      frequency:       RADIO_FREQUENCY_HZ,
-      spreadingFactor: RADIO_SPREADING_FACTOR,
-      bandwidth:       RADIO_BANDWIDTH_HZ,
-      unreadCount:     0,
-      reachability:    "offline",
-      location:        { ...waypoint.location, timestamp: new Date() },
-    });
-    setShowCompass(true);
-    setShowWaypoints(false);
-  };
 
   // ════════════════════════════════════════════════════════════════════════
   // [NEW] PAIR REQUEST VIA LORA (called by AddDeviceModal when "Add" tapped)
@@ -1446,13 +1582,58 @@ export default function FlingApp() {
   // ════════════════════════════════════════════════════════════════════════
   return (
     <>
+      {/* [STEP 12] SOS mesh-confidence banner (item 9) — the mesh's flagship
+          "help is being coordinated" reassurance. Deliberately persistent
+          (no auto-dismiss timer, unlike the notices below) since this is the
+          most important context a user can have during an actual emergency.
+          Fully interactive (pointer-events-auto throughout, not just a tap
+          zone) — it's a small panel, not a passing toast. */}
+      {sosStatus && !showSplash && isWiFiConnected && (
+        <div className="fixed top-0 left-0 right-0 z-50 flex justify-center pt-14 px-4">
+          <div className="bg-red-950/95 border border-red-700 text-white text-sm px-4 py-3 rounded-xl shadow-lg shadow-red-900/50 flex flex-col gap-2 max-w-sm w-full animate-[fade-in_0.25s_ease-out]">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <span className="h-2.5 w-2.5 rounded-full bg-red-400 animate-pulse" />
+                <span className="font-semibold">SOS Active</span>
+              </div>
+              <button
+                onClick={() => setSosStatus(null)}
+                className="text-red-300 hover:text-white transition-colors"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <p className="text-red-100">
+              {sosStatus.confirmedBy.length === 0
+                ? "Propagating through the mesh — waiting for confirmation…"
+                : `${sosStatus.confirmedBy.length} node${sosStatus.confirmedBy.length > 1 ? "s" : ""} confirmed receipt — help is reachable.`}
+            </p>
+            <button
+              onClick={() => {
+                setShowMap(true);
+                if (navigator.geolocation && mapGpsWatchIdRef.current === null) {
+                  mapGpsWatchIdRef.current = navigator.geolocation.watchPosition(
+                    (pos) => setUserGpsPosition(pos),
+                    () => {},
+                    { enableHighAccuracy: true, maximumAge: 0 },
+                  );
+                }
+              }}
+              className="self-start text-xs font-medium text-red-200 hover:text-white underline underline-offset-2"
+            >
+              View responders on map
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* [v6 RANGE DETECTION] Transient notification banner. Slides in at the top
           when a node changes reachability (out of range / weak / back online) and
           auto-dismisses after a few seconds. pointer-events-none so it never
           blocks taps underneath. Hidden during splash/Wi-Fi setup. */}
       {rangeNotice && !showSplash && isWiFiConnected && (
         <div className="fixed top-0 left-0 right-0 z-50 flex justify-center pt-14 px-4 pointer-events-none">
-          <div className="bg-gray-900/95 border border-gray-700 text-white text-sm px-4 py-2.5 rounded-xl shadow-lg flex items-center gap-2 animate-[fade-in_0.25s_ease-out]">
+          <div className="bg-gray-900/95 border border-gray-700 text-white text-sm px-4 py-2.5 rounded-xl shadow-lg flex items-center gap-2 animate-[fade-in_0.25s_ease-out]" style={{ marginTop: sosStatus ? 96 : 0 }}>
             <span className="h-2 w-2 rounded-full bg-orange-400 animate-pulse" />
             {rangeNotice}
           </div>
@@ -1464,7 +1645,7 @@ export default function FlingApp() {
           unrelated reachability change can never silently swallow this. */}
       {deliveryNotice && !showSplash && isWiFiConnected && (
         <div className="fixed top-0 left-0 right-0 z-50 flex justify-center pt-14 px-4 pointer-events-none">
-          <div className="bg-gray-900/95 border border-red-800 text-white text-sm px-4 py-2.5 rounded-xl shadow-lg flex items-center gap-2 animate-[fade-in_0.25s_ease-out]" style={{ marginTop: rangeNotice ? 48 : 0 }}>
+          <div className="bg-gray-900/95 border border-red-800 text-white text-sm px-4 py-2.5 rounded-xl shadow-lg flex items-center gap-2 animate-[fade-in_0.25s_ease-out]" style={{ marginTop: (sosStatus ? 96 : 0) + (rangeNotice ? 48 : 0) }}>
             <span className="h-2 w-2 rounded-full bg-red-500" />
             {deliveryNotice}
           </div>
@@ -1476,8 +1657,20 @@ export default function FlingApp() {
       {locationNotice && !showSplash && isWiFiConnected && (
         <div className="fixed top-0 left-0 right-0 z-50 flex justify-center pt-14 px-4 pointer-events-none">
           <div
-            className="bg-gray-900/95 border border-blue-800 text-white text-sm px-4 py-2.5 rounded-xl shadow-lg flex items-center gap-2 animate-[fade-in_0.25s_ease-out]"
-            style={{ marginTop: (rangeNotice ? 48 : 0) + (deliveryNotice ? 48 : 0) }}
+            // [STEP 12] pointer-events-auto re-enables taps on just this
+            // banner (its container is pointer-events-none so it never
+            // blocks the screen underneath) — only meaningful when an SOS
+            // location notice armed a tap action above.
+            onClick={() => {
+              if (!locationNoticeActionRef.current) return;
+              locationNoticeActionRef.current();
+              locationNoticeActionRef.current = null;
+              setLocationNotice(null);
+            }}
+            className={`bg-gray-900/95 border border-blue-800 text-white text-sm px-4 py-2.5 rounded-xl shadow-lg flex items-center gap-2 animate-[fade-in_0.25s_ease-out] pointer-events-auto ${
+              locationNoticeActionRef.current ? "cursor-pointer hover:bg-gray-800/95" : ""
+            }`}
+            style={{ marginTop: (sosStatus ? 96 : 0) + (rangeNotice ? 48 : 0) + (deliveryNotice ? 48 : 0) }}
           >
             <span className="h-2 w-2 rounded-full bg-blue-400" />
             {locationNotice}
@@ -1560,6 +1753,7 @@ export default function FlingApp() {
           spreadingFactor={RADIO_SPREADING_FACTOR}
           bandwidthHz={RADIO_BANDWIDTH_HZ}
           stats={nodeStats}
+          contacts={contacts}
           onClose={() => setShowNodeStats(false)}
         />
       )}
@@ -1569,8 +1763,44 @@ export default function FlingApp() {
         <WaypointManagerModal
           userPosition={userGpsPosition}
           onNavigate={handleNamedWaypointNavigate}
+          // [STEP 11] Switch to the offline map without tearing down the
+          // shared GPS watch (Map needs userGpsPosition too).
+          onOpenMap={() => { setShowWaypoints(false); setShowMap(true); }}
+          isRecordingTrail={breadcrumb.isRecording}
+          activeTrail={breadcrumb.activeTrail}
+          onStartRecording={breadcrumb.startRecording}
+          onStopRecording={breadcrumb.stopRecording}
           onClose={() => {
             setShowWaypoints(false);
+            if (mapGpsWatchIdRef.current !== null) {
+              navigator.geolocation?.clearWatch(mapGpsWatchIdRef.current);
+              mapGpsWatchIdRef.current = null;
+            }
+          }}
+        />
+      )}
+
+      {/* ── [STEP 11] Offline map ─────────────────────────────────────────── */}
+      {showMap && (
+        <MapNavigationModal
+          userPosition={userGpsPosition}
+          targetLocation={mapTargetLocation}
+          // [STEP 12] Show every contact's last-known location as a map
+          // marker, not just saved waypoints — "shared locations" should be
+          // visualised the same way everywhere, per the map being the
+          // primary visualization for location data throughout the app.
+          contacts={contacts}
+          activeTrail={breadcrumb.activeTrail}
+          onNavigateWaypoint={handleNamedWaypointNavigate}
+          onNavigateContact={(contact) => {
+            setCurrentContact(contact);
+            setActiveNavContact(contact);
+            setShowCompass(true);
+            setShowMap(false);
+          }}
+          onClose={() => {
+            setShowMap(false);
+            setMapTargetLocation(null);
             if (mapGpsWatchIdRef.current !== null) {
               navigator.geolocation?.clearWatch(mapGpsWatchIdRef.current);
               mapGpsWatchIdRef.current = null;
@@ -1746,6 +1976,20 @@ export default function FlingApp() {
             setShowCompass(false);
             setActiveNavContact(null);
             resetAllLocationState();
+          }}
+          // [STEP 12] Switch to the map view for this same target.
+          onViewMap={() => {
+            const live = contacts.find((c) => c.deviceId === currentContact.deviceId) ?? currentContact;
+            if (!live.location) return;
+            setMapTargetLocation({ lat: live.location.lat, lng: live.location.lng, label: live.deviceName });
+            if (navigator.geolocation && mapGpsWatchIdRef.current === null) {
+              mapGpsWatchIdRef.current = navigator.geolocation.watchPosition(
+                (pos) => setUserGpsPosition(pos),
+                () => {},
+                { enableHighAccuracy: true, maximumAge: 0 },
+              );
+            }
+            setShowMap(true);
           }}
         />
       )}

@@ -33,7 +33,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Compass, MapPin, WifiOff, X } from "lucide-react";
+import { Check, Compass, MapPin, WifiOff, X } from "lucide-react";
 
 import { Button }           from "@/components/ui/button";
 import useGeolocation       from "@/hooks/use-geolocation";
@@ -53,6 +53,10 @@ interface CompassModalProps {
    * leaving the navigation session active in the background.
    */
   onMinimize?: () => void;
+  /** [STEP 12] Switch to the map view for this same contact/waypoint —
+      reuses the existing navigation architecture instead of a separate
+      location UI, per the map being the primary visualization throughout. */
+  onViewMap?: () => void;
 }
 
 function formatAge(ms: number): string {
@@ -77,17 +81,41 @@ function angularDiff(a: number, b: number): number {
 const GPS_BEARING_ALPHA = 0.30;  // smoothes GPS-derived bearing to target
 const NEEDLE_ALPHA      = 0.40;  // smoothes the final needle angle
 const DISTANCE_ALPHA    = 0.30;  // smoothes raw distance calculation
+// [STEP 12] The displayed "±X m" accuracy figures previously showed the RAW
+// instantaneous accuracy every render — even after Step 11 fixed the
+// fabricated-5000m bug, real GPS accuracy still bounces sample to sample,
+// so the readout itself still visibly flickered. Smoothing it the same way
+// distance already is fixes that without changing what the number MEANS.
+const ACCURACY_ALPHA = 0.25;
+
+// [STEP 12] "Arrived" state — see distanceTexts / hasArrived below.
+const ARRIVAL_DISTANCE_M = 2;
+
+// [STEP 12] A location fix's accuracy describes uncertainty AT THE MOMENT
+// IT WAS CAPTURED. As a fix ages, the person could have moved — an old fix
+// that LOOKS precise (small accuracy value) is actually less trustworthy
+// than a fresh one with the same accuracy. Inflate the effective accuracy
+// used for distance/arrival math by an assumed walking pace for every
+// second since the fix was taken, capped so a very stale fix doesn't
+// produce an absurd number (it's already shown as "may no longer be
+// accurate" via LOCATION_LOST_MS at that point anyway).
+const ASSUMED_MOVEMENT_SPEED_MPS = 1.4; // average walking pace
+const MAX_STALENESS_INFLATION_M  = 150;
 
 export function CompassModal({
   contact,
   onBeep,
   onClose,
   onMinimize,
+  onViewMap,
 }: CompassModalProps) {
   const {
     position: userPosition,
     requestPermission: requestGeoPermission,
     usingFallback,
+    // [STEP 11] True until a fix is either accurate enough or the warm-up
+    // window elapses — see isWarmingUp in use-geolocation.ts.
+    isWarmingUp,
   } = useGeolocation();
 
   // Tick clock for "X ago" staleness display — fires every second, not
@@ -104,6 +132,10 @@ export function CompassModal({
     hasSupport: hasDeviceOrientationSupport,
     requestPermission: requestCompassPermission,
     isAbsolute: compassIsAbsolute,
+    // [STEP 11] Previously computed by the hook but never read anywhere —
+    // the app had a built-in detector for jumpy/stuck compass readings that
+    // silently went unused. Now surfaced as an explicit warning below.
+    needsCalibration,
   } = useDeviceOrientation({ userPosition });
 
   // ── [Step 9] All intermediate values live in REFS (no extra re-renders).
@@ -111,12 +143,18 @@ export function CompassModal({
   const smoothedAbsBearingRef = useRef<number | null>(null); // GPS bearing EMA
   const smoothedNeedleRef     = useRef<number | null>(null); // needle angle EMA
   const smoothedDistanceRef   = useRef<number | null>(null); // distance EMA
+  // [STEP 12] Smoothed accuracy EMAs — same rationale as smoothedDistanceRef,
+  // applied to the displayed "±X m" figures instead of the underlying fix.
+  const smoothedMyAccuracyRef     = useRef<number | null>(null);
+  const smoothedTargetAccuracyRef = useRef<number | null>(null);
   const lastRenderedNeedle    = useRef<number>(0);           // skip threshold guard
 
   // These are the values that drive the render.
   const [displayNeedle,   setDisplayNeedle]   = useState<number>(0);
   const [displayBearing,  setDisplayBearing]  = useState<number | null>(null);
   const [displayDistance, setDisplayDistance] = useState<number | null>(null);
+  const [displayMyAccuracy,     setDisplayMyAccuracy]     = useState<number | null>(null);
+  const [displayTargetAccuracy, setDisplayTargetAccuracy] = useState<number | null>(null);
   const [isBeeping,       setIsBeeping]       = useState(false);
   const [permissionsRequested, setPermissionsRequested] = useState(false);
 
@@ -136,6 +174,11 @@ export function CompassModal({
   // Now: everything is computed synchronously inside one effect.
   useEffect(() => {
     if (!userPosition || !targetLocation) return;
+    // [STEP 11] Don't seed the EMA smoothers with a fix that hasn't warmed
+    // up yet — a bad first bearing/distance reading persists for many
+    // samples afterward because EMA blends toward it gradually rather than
+    // discarding it outright.
+    if (isWarmingUp) return;
 
     const myLat = userPosition.coords.latitude;
     const myLng = userPosition.coords.longitude;
@@ -161,6 +204,25 @@ export function CompassModal({
       setDisplayDistance(smoothedDist);
     }
 
+    // ── 2b. Accuracy display smoothing (separate from arrival/distance math,
+    // which still reacts to real changes — this purely stops the "±X m"
+    // readouts from visibly flickering on every raw GPS sample). ──────────
+    const rawMyAcc = userPosition.coords.accuracy;
+    const prevMyAcc = smoothedMyAccuracyRef.current;
+    const smoothedMyAcc = prevMyAcc === null
+      ? rawMyAcc
+      : prevMyAcc * (1 - ACCURACY_ALPHA) + rawMyAcc * ACCURACY_ALPHA;
+    smoothedMyAccuracyRef.current = smoothedMyAcc;
+    setDisplayMyAccuracy(smoothedMyAcc);
+
+    const rawTargetAcc = targetLocation.accuracy;
+    const prevTargetAcc = smoothedTargetAccuracyRef.current;
+    const smoothedTargetAcc = prevTargetAcc === null
+      ? rawTargetAcc
+      : prevTargetAcc * (1 - ACCURACY_ALPHA) + rawTargetAcc * ACCURACY_ALPHA;
+    smoothedTargetAccuracyRef.current = smoothedTargetAcc;
+    setDisplayTargetAccuracy(smoothedTargetAcc);
+
     // ── 3. Needle angle (GPS bearing − device heading, then EMA) ─────────
     // Only compute if we have a compass heading.
     if (!direction) return;
@@ -184,7 +246,7 @@ export function CompassModal({
       setDisplayNeedle(rounded);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [userPosition, targetLocation, direction]); // displayDistance intentionally excluded
+  }, [userPosition, targetLocation, direction, isWarmingUp]); // displayDistance intentionally excluded
 
   // ── Staleness & accuracy ──────────────────────────────────────────────────
   const locationAgeMs  = targetLocation ? now - new Date(targetLocation.timestamp).getTime() : null;
@@ -194,14 +256,26 @@ export function CompassModal({
   // [Step 9 — Issue 4] Accuracy-aware distance display.
   // If the combined GPS uncertainty (my error + their error) exceeds the
   // measured distance, the number is noise — show "< Xm" instead.
-  const myAccuracy     = userPosition?.coords.accuracy ?? null;
-  const targetAccuracy = targetLocation?.accuracy ?? null;
+  // [STEP 12] Uses the SMOOTHED accuracy figures (see the main effect above)
+  // rather than the raw instantaneous value, and inflates the target's
+  // accuracy for how stale their fix is (see ASSUMED_MOVEMENT_SPEED_MPS).
+  const myAccuracy = displayMyAccuracy;
+  const staleInflationM = locationAgeMs !== null
+    ? Math.min((locationAgeMs / 1000) * ASSUMED_MOVEMENT_SPEED_MPS, MAX_STALENESS_INFLATION_M)
+    : 0;
+  const targetAccuracy = displayTargetAccuracy !== null ? displayTargetAccuracy + staleInflationM : null;
   const totalAccuracy  = myAccuracy !== null && targetAccuracy !== null
     ? myAccuracy + targetAccuracy
     : myAccuracy ?? null;
 
   const distanceIsWithinAccuracy =
     displayDistance !== null && totalAccuracy !== null && displayDistance < totalAccuracy;
+
+  // [STEP 12] "Arrived" — the estimated distance itself (not just relative
+  // to GPS error) is small enough that continuing to compute a precise
+  // bearing has no value; GPS error at this range exceeds the real distance
+  // by definition, so a spinning needle just invites misinterpretation.
+  const hasArrived = displayDistance !== null && displayDistance < ARRIVAL_DISTANCE_M;
 
   const distanceInFeet   = displayDistance !== null ? Math.round(displayDistance * 3.28084) : 0;
   const distanceInMeters = displayDistance !== null ? Math.round(displayDistance) : 0;
@@ -223,6 +297,24 @@ export function CompassModal({
       return { value: "--", unit: "ft", direction: "searching..." };
     }
 
+    // [STEP 11] Close-range mode. Bearing-to-target computed from two
+    // independently-noisy GPS fixes gets LESS reliable the closer the two
+    // points are — a few metres of GPS jitter can swing the computed bearing
+    // by dozens of degrees once the real distance shrinks to GPS-error scale.
+    // Once we've already admitted the distance number itself is noise
+    // (distanceIsWithinAccuracy), showing a confident "slightly left" /
+    // "behind (right)" directional readout on TOP of that is actively
+    // misleading — this is exactly the "target behind (left), 224°, both
+    // standing beside each other" failure mode from field testing. Replace
+    // the false-precision direction text with an honest one instead.
+    if (distanceIsWithinAccuracy) {
+      return {
+        value:     `~${Math.round(totalAccuracy!)}`,
+        unit:      "ft",
+        direction: "nearby — look around",
+      };
+    }
+
     let dir = "ahead";
     const abs = Math.abs(displayNeedle);
     if      (abs < 10)                        dir = "ahead";
@@ -234,7 +326,7 @@ export function CompassModal({
     else                                      dir = "behind (left)";
 
     return {
-      value:     distanceIsWithinAccuracy ? `~${Math.round(totalAccuracy!)}` : distanceInFeet.toString(),
+      value:     distanceInFeet.toString(),
       unit:      "ft",
       direction: dir,
     };
@@ -269,7 +361,21 @@ export function CompassModal({
         </p>
       </button>
 
-      <div className="w-16" />
+      {/* [STEP 12] View on Map — reuses the existing map/navigation
+          architecture instead of a separate location UI. */}
+      {onViewMap ? (
+        <button onClick={onViewMap} className="group relative">
+          <div className="absolute inset-0 bg-blue-500 rounded-full opacity-0 group-hover:opacity-20 transition-opacity duration-200" />
+          <div className="relative bg-gray-800/80 backdrop-blur-sm p-4 rounded-full border border-gray-700 transition-all group-hover:border-blue-500/50 group-active:scale-95">
+            <MapPin className="w-6 h-6 text-gray-300 group-hover:text-blue-400 transition-colors" />
+          </div>
+          <p className="text-xs text-gray-500 text-center mt-2 opacity-0 group-hover:opacity-100 transition-opacity">
+            Map
+          </p>
+        </button>
+      ) : (
+        <div className="w-16" />
+      )}
 
       {!isWaypoint ? (
         <button onClick={handleBeep} className={`group relative transition-all ${isBeeping ? "animate-pulse" : ""}`}>
@@ -373,6 +479,23 @@ export function CompassModal({
           </div>
         </div>
 
+        {hasArrived ? (
+          // [STEP 12] Same "arrived" state as phone-compass mode — see there
+          // for the reasoning (bearing has no value once GPS error exceeds
+          // the real distance).
+          <div className="flex flex-col items-center justify-center">
+            <div className="relative">
+              <div className="absolute inset-0 rounded-full bg-emerald-500/30 blur-2xl animate-pulse" />
+              <div className="relative w-40 h-40 rounded-full bg-emerald-600 border-4 border-emerald-400 flex items-center justify-center shadow-2xl shadow-emerald-500/40">
+                <Check className="w-20 h-20 text-white" strokeWidth={3} />
+              </div>
+            </div>
+            <p className="text-2xl font-bold mt-6 text-emerald-400">You&apos;ve arrived</p>
+            <p className="text-sm text-gray-400 mt-1 text-center px-8">
+              {contact.deviceName} should be right here
+            </p>
+          </div>
+        ) : (
         <div className="flex flex-col items-center">
           <div className="relative w-64 h-64">
             <svg className="absolute inset-0 w-full h-full opacity-20" viewBox="0 0 256 256">
@@ -401,6 +524,7 @@ export function CompassModal({
             </div>
           </div>
         </div>
+        )}
 
         <div className="w-full flex flex-col items-center mb-8">
           <div className="bg-gray-800/80 backdrop-blur rounded-2xl px-8 py-4 border border-gray-700 text-center mb-6">
@@ -426,12 +550,13 @@ export function CompassModal({
           </div>
           <div className="text-xs text-gray-500 text-center space-y-0.5">
             {!userPosition && <p>Getting location…</p>}
+            {userPosition && isWarmingUp && <p>Acquiring precise GPS…</p>}
             {usingFallback && userPosition && <p className="text-yellow-600">⚠ Approximate location only (no GPS)</p>}
             {userPosition && targetLocation && (
               <>
                 <p>Your GPS: {userPosition.coords.latitude.toFixed(5)}°, {userPosition.coords.longitude.toFixed(5)}°</p>
                 <p>Target:   {targetLocation.lat.toFixed(5)}°, {targetLocation.lng.toFixed(5)}°</p>
-                <p>My accuracy: ±{Math.round(userPosition.coords.accuracy)} m
+                <p>My accuracy: ±{myAccuracy !== null ? Math.round(myAccuracy) : "?"} m
                   {targetAccuracy !== null && ` · Target: ±${Math.round(targetAccuracy)} m`}
                 </p>
               </>
@@ -449,6 +574,17 @@ export function CompassModal({
       <div className="w-full text-center mt-4">
         <p className="text-sm uppercase opacity-75">Finding</p>
         <h1 className="text-3xl font-bold mt-1">{contact.deviceName}</h1>
+        {/* [STEP 12] Mesh path indication (item 8) — how many hops away this
+            contact currently is, at the level of detail the firmware
+            actually tracks (hop count; the literal relay chain isn't
+            recorded on the wire without a protocol change). */}
+        {!isWaypoint && contact.signalHopDistance !== undefined && (
+          <p className="text-xs text-gray-500 mt-0.5">
+            {contact.signalHopDistance === 0
+              ? "Direct connection"
+              : `Via mesh relay — ${contact.signalHopDistance} hop${contact.signalHopDistance > 1 ? "s" : ""} away`}
+          </p>
+        )}
         {usingFallback && (
           <div className="mt-2 inline-flex items-center gap-1.5 bg-yellow-900/40 border border-yellow-700/50 rounded-full px-3 py-1 text-xs text-yellow-300">
             <MapPin className="w-3 h-3" />City-level location (no GPS)
@@ -456,39 +592,70 @@ export function CompassModal({
         )}
       </div>
 
-      {/* Compass needle — NO CSS transition (EMA provides the smoothing) */}
-      <div className="flex flex-col items-center">
-        <div className="w-4 h-4 bg-blue-400 rounded-full shadow-lg shadow-blue-400/50 mb-2" />
-        <div
-          style={{
-            transform: `rotate(${displayNeedle}deg)`,
-            // [Step 9] Removed transition-transform entirely.
-            // The EMA filter in use-device-orientation + NEEDLE_ALPHA above
-            // provide all the visual smoothing needed. The old CSS transition
-            // was re-triggering every 100ms → perpetual "chasing" animation.
-          }}
-        >
-          <svg width="240" height="240" viewBox="0 0 24 24" fill="none">
-            <path d="M12 3L16 21L12 17L8 21L12 3Z" fill="white"
-              stroke="rgba(255,255,255,0.4)" strokeWidth="0.5" />
-          </svg>
+      {/* [STEP 12] "Arrived" state — replaces the needle entirely once the
+          estimated distance is small enough that a precise bearing has no
+          value (GPS error at this range already exceeds the real distance).
+          A spinning/dimmed needle at this point invites misinterpretation;
+          a plain, unambiguous "you've arrived" is the honest signal. */}
+      {hasArrived ? (
+        <div className="flex flex-col items-center justify-center">
+          <div className="relative">
+            <div className="absolute inset-0 rounded-full bg-emerald-500/30 blur-2xl animate-pulse" />
+            <div className="relative w-40 h-40 rounded-full bg-emerald-600 border-4 border-emerald-400 flex items-center justify-center shadow-2xl shadow-emerald-500/40">
+              <Check className="w-20 h-20 text-white" strokeWidth={3} />
+            </div>
+          </div>
+          <p className="text-2xl font-bold mt-6 text-emerald-400">You&apos;ve arrived</p>
+          <p className="text-sm text-gray-400 mt-1 text-center px-8">
+            {contact.deviceName} should be right here
+          </p>
         </div>
-      </div>
+      ) : (
+        /* Compass needle — NO CSS transition (EMA provides the smoothing) */
+        <div className="flex flex-col items-center">
+          <div className="w-4 h-4 bg-blue-400 rounded-full shadow-lg shadow-blue-400/50 mb-2" />
+          <div
+            className={distanceIsWithinAccuracy ? "opacity-30 transition-opacity duration-500" : "transition-opacity duration-500"}
+            style={{
+              transform: `rotate(${displayNeedle}deg)`,
+              // [Step 9] Removed transition-transform entirely.
+              // The EMA filter in use-device-orientation + NEEDLE_ALPHA above
+              // provide all the visual smoothing needed. The old CSS transition
+              // was re-triggering every 100ms → perpetual "chasing" animation.
+              // [STEP 11] Opacity IS allowed to transition (unlike rotation) —
+              // it's a one-off fade when entering/leaving close-range mode, not
+              // a per-sensor-tick animation, so it can't cause the old chasing
+              // bug. Dimmed because a needle claiming a precise bearing while
+              // we're simultaneously telling the user "the distance number is
+              // noise" is contradictory — see distanceTexts above.
+            }}
+          >
+            <svg width="240" height="240" viewBox="0 0 24 24" fill="none">
+              <path d="M12 3L16 21L12 17L8 21L12 3Z" fill="white"
+                stroke="rgba(255,255,255,0.4)" strokeWidth="0.5" />
+            </svg>
+          </div>
+        </div>
+      )}
 
       {/* Distance + direction card — no animation on the card itself */}
       <div className="w-full flex flex-col items-center mb-8">
         <div className="flex flex-col items-center">
-          <div className="flex items-baseline">
-            <span className="text-5xl font-semibold">{distanceTexts.value}</span>
-            {distanceTexts.unit && <span className="text-3xl opacity-75 ml-1">{distanceTexts.unit}</span>}
-          </div>
-          <p className="text-3xl font-medium mt-1">{distanceTexts.direction}</p>
+          {!hasArrived && (
+            <>
+              <div className="flex items-baseline">
+                <span className="text-5xl font-semibold">{distanceTexts.value}</span>
+                {distanceTexts.unit && <span className="text-3xl opacity-75 ml-1">{distanceTexts.unit}</span>}
+              </div>
+              <p className="text-3xl font-medium mt-1">{distanceTexts.direction}</p>
 
-          {/* [Step 9] Accuracy caveat when GPS error exceeds measured distance */}
-          {distanceIsWithinAccuracy && totalAccuracy !== null && (
-            <p className="text-xs text-amber-400 mt-1 text-center px-4">
-              Within GPS error margin — actual distance unknown (±{Math.round(totalAccuracy)} m)
-            </p>
+              {/* [Step 9] Accuracy caveat when GPS error exceeds measured distance */}
+              {distanceIsWithinAccuracy && totalAccuracy !== null && (
+                <p className="text-xs text-amber-400 mt-1 text-center px-4">
+                  Within GPS error margin — actual distance unknown (±{Math.round(totalAccuracy)} m)
+                </p>
+              )}
+            </>
           )}
 
           {/* [Step 6] Staleness */}
@@ -502,14 +669,31 @@ export function CompassModal({
 
           <div className="mt-4 text-xs text-gray-500 text-center">
             {!userPosition && <p>Getting GPS location…</p>}
-            {!direction && userPosition && <p>Accessing compass…</p>}
+            {/* [STEP 11] Position exists but hasn't reached a trustworthy
+                accuracy yet — the main effect above withholds bearing/distance
+                updates during this window (see isWarmingUp), so say so instead
+                of silently showing nothing or a stale "searching...". */}
+            {userPosition && isWarmingUp && <p>Acquiring precise GPS…</p>}
+            {!direction && userPosition && !isWarmingUp && <p>Accessing compass…</p>}
             {direction && (
-              <p>
-                Heading: {direction.degrees.toFixed(0)}° {direction.cardinal}
-                <span className={`ml-2 ${compassIsAbsolute ? "text-emerald-400" : "text-amber-400"}`}>
-                  {compassIsAbsolute ? "● calibrated" : "● move in a figure-8"}
-                </span>
-              </p>
+              <>
+                <p>
+                  Heading: {direction.degrees.toFixed(0)}° {direction.cardinal}
+                  <span className={`ml-2 ${(!compassIsAbsolute || needsCalibration) ? "text-amber-400" : "text-emerald-400"}`}>
+                    {(!compassIsAbsolute || needsCalibration) ? "● move in a figure-8" : "● calibrated"}
+                  </span>
+                </p>
+                {/* [STEP 11] needsCalibration is distinct from !compassIsAbsolute:
+                    it fires even on a device correctly receiving absolute
+                    (magnetic-north) events, when the recent readings
+                    themselves look stuck or erratically jumpy — a case the
+                    "● calibrated" dot alone would otherwise miss entirely. */}
+                {needsCalibration && (
+                  <p className="text-amber-400 mt-0.5">
+                    ⚠ Compass readings look unstable — move your phone in a figure-8
+                  </p>
+                )}
+              </>
             )}
             {displayBearing !== null && <p>Target: {displayBearing}°</p>}
             {userPosition && targetLocation && (

@@ -1,23 +1,52 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // components/map-navigation-modal.tsx
 //
-// [STEP 8] Map-based navigation replacing the text-only waypoint list.
+// [STEP 8] Original map-based navigation. [STEP 9] Its OSM tile layer was
+// removed (real map tiles require internet, which conflicts with 100%
+// offline operation) and the component was left unwired — the app moved to
+// the compass-only WaypointManagerModal instead, leaving this file orphaned.
+//
+// [STEP 11] Revived as a genuine offline map, per plan: an offline BASEMAP
+// bundled directly inside the app itself, not downloaded in the field.
+//
+//   HOW THE OFFLINE BASEMAP WORKS
+//   ──────────────────────────────
+//   This app already ships its entire web build as static assets inside the
+//   installed APK (see capacitor.config.ts webDir + `npx cap sync android`).
+//   A folder of pre-generated map tile IMAGES bundled the same way — under
+//   `public/tiles/{z}/{x}/{y}.png` — rides along in the app bundle exactly
+//   like every other static asset: present on the phone from first install,
+//   zero download, zero internet ever required.
+//
+//   This component looks for `public/tiles/manifest.json` at runtime via a
+//   same-origin fetch (NOT a network call — it's reading a bundled asset
+//   from the app's own local origin, identical to loading any other app
+//   image). If that manifest exists, its bounds/zoom range are used to add a
+//   local tile layer and fit the map to the covered area. If it doesn't
+//   exist (no tile package has been generated/added yet), the map falls back
+//   to exactly today's behaviour — a plain dark canvas with markers, no
+//   basemap — so this is a strict addition with no regression.
+//
+//   GENERATING A REAL TILE PACKAGE (a one-time, manual, INTERNET-REQUIRING
+//   step done by the team ahead of a deployment — never done by the field
+//   user, never done automatically): see public/tiles/README.md for the
+//   exact folder/manifest convention this component expects. This component
+//   cannot generate real map imagery itself — that requires knowing the
+//   specific operating area, which is a deployment decision, not something
+//   to guess.
 //
 // Features:
-//   • Full Leaflet map with OpenStreetMap tiles (cached in browser when
-//     internet was available — tiles still display offline if cached).
+//   • Optional offline basemap (see above) — gracefully absent if not installed.
 //   • Tap anywhere on the map to place or move a destination marker.
 //   • Shows the user's live GPS position (blue dot).
 //   • Draws a straight-line route from the user to the selected destination.
 //   • Displays bearing and distance to the selected point.
-//   • Save named waypoints (persisted in localStorage via lib/storage).
-//   • Delete waypoints.
-//   • Tap a saved waypoint to navigate to it.
-//   • Compass bearing shown as text and as animated arrow when destination set.
-//
-// Map tile note: OpenStreetMap tiles require internet to DOWNLOAD, but once
-// the browser has cached them, they show offline. For emergency field use,
-// open the app in the target area while connected to download the tiles first.
+//   • Shows saved NamedWaypoints (the same data model as WaypointManagerModal
+//     and SOS auto-waypoints — [STEP 11] switched from the legacy Trail-based
+//     Waypoint model so the map and the waypoint list always agree).
+//   • [STEP 11] Draws the active breadcrumb trail (if recording — see
+//     use-breadcrumb-trail.ts) as a connected line of the points captured so far.
+//   • Tap a saved waypoint to navigate to it, or hand off to the Compass.
 // ─────────────────────────────────────────────────────────────────────────────
 
 "use client";
@@ -35,15 +64,35 @@ import {
 
 import { Button } from "@/components/ui/button";
 import { calculateBearing, calculateDistance } from "@/lib/geo";
-import { readTrails, writeTrails } from "@/lib/storage";
-import type { Waypoint } from "@/lib/types";
+import { readWaypoints, writeWaypoints, type NamedWaypoint } from "@/lib/storage";
+import type { Contact, Trail } from "@/lib/types";
 
 interface MapNavigationModalProps {
   /** User's live GPS position (from the geolocation hook or raw API). */
   userPosition: GeolocationPosition | null;
-  /** If set, the map centres on this contact's location (e.g. SOS sender). */
+  /** If set, the map centres on this location (e.g. an SOS sender). */
   targetLocation?: { lat: number; lng: number; label?: string } | null;
+  /** [STEP 11] The in-progress breadcrumb trail, if recording is active. */
+  activeTrail?: Trail | null;
+  /** [STEP 12] Every known contact — those with a last-known location are
+      drawn as map markers too, not just saved waypoints, so the map is the
+      primary visualization for any shared location, not only Waypoints. */
+  contacts?: Contact[];
+  /** [STEP 11] Hand off a tapped waypoint to the Compass for bearing/distance nav. */
+  onNavigateWaypoint?: (wp: NamedWaypoint) => void;
+  /** [STEP 12] Hand off a tapped contact marker to the Compass. */
+  onNavigateContact?: (contact: Contact) => void;
   onClose: () => void;
+}
+
+// [STEP 11] Local-tile-package manifest convention — see public/tiles/README.md.
+interface TileManifest {
+  minZoom: number;
+  maxZoom: number;
+  tileSize?: number;
+  // [south, west, north, east]
+  bounds: [number, number, number, number];
+  attribution?: string;
 }
 
 function formatDist(m: number): string {
@@ -59,6 +108,10 @@ function cardinalLabel(deg: number): string {
 export default function MapNavigationModal({
   userPosition,
   targetLocation,
+  activeTrail,
+  contacts,
+  onNavigateWaypoint,
+  onNavigateContact,
   onClose,
 }: MapNavigationModalProps) {
   const mapContainerRef = useRef<HTMLDivElement>(null);
@@ -72,22 +125,31 @@ export default function MapNavigationModal({
   const routeLineRef    = useRef<any>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const waypointLayersRef = useRef<any[]>([]);
+  // [STEP 12] Separate layer group for contact-location markers, so they can
+  // be redrawn independently of saved waypoints.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const contactLayersRef = useRef<any[]>([]);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const trailLineRef    = useRef<any>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const tileLayerRef    = useRef<any>(null);
 
   const [destination, setDestination]   = useState<{ lat: number; lng: number } | null>(null);
   const [bearing, setBearing]           = useState<number | null>(null);
   const [distance, setDistance]         = useState<number | null>(null);
-  const [waypoints, setWaypoints]       = useState<Waypoint[]>([]);
+  const [waypoints, setWaypoints]       = useState<NamedWaypoint[]>([]);
   const [showSaveForm, setShowSaveForm] = useState(false);
   const [waypointName, setWaypointName] = useState("");
-  const [waypointType, setWaypointType] = useState<Waypoint["type"]>("waypoint");
+  const [waypointType, setWaypointType] = useState<NamedWaypoint["type"]>("waypoint");
   const [mapReady, setMapReady]         = useState(false);
+  // [STEP 11] Whether a local offline tile package was found — purely
+  // informational (shown in the header) so the user knows why the map is
+  // either a real basemap or a plain dark canvas.
+  const [hasOfflineBasemap, setHasOfflineBasemap] = useState(false);
 
   // ── Load saved waypoints on mount ────────────────────────────────────────
   useEffect(() => {
-    const trails = readTrails();
-    // Flatten all waypoints from all trails into a single list for display.
-    const all = trails.flatMap((t) => t.waypoints);
-    setWaypoints(all);
+    setWaypoints(readWaypoints());
   }, []);
 
   // ── Initialise Leaflet map (browser-only, dynamic import) ─────────────────
@@ -116,11 +178,6 @@ export default function MapNavigationModal({
       const initLng = userPosition?.coords.longitude ?? targetLocation?.lng ?? 0;
       const initZoom = (userPosition || targetLocation) ? 16 : 2;
 
-      // [OFFLINE] No tile layer — OSM tiles require internet, which violates
-      // the system's core rule of 100% offline operation. The map still gives
-      // full spatial navigation: user position, destination, route line,
-      // bearing and distance, and waypoints all work with zero network access.
-      // In the field you navigate by bearing + distance, not street labels.
       const map = L.map(mapContainerRef.current, {
         center: [initLat, initLng],
         zoom:   initZoom,
@@ -136,6 +193,34 @@ export default function MapNavigationModal({
         const { lat, lng } = e.latlng;
         setDestination({ lat, lng });
       });
+
+      // [STEP 11] Look for a bundled offline tile package. This is a
+      // same-origin fetch of a static asset shipped inside the app bundle —
+      // not a network request — so it works identically with zero
+      // connectivity. Absent manifest = no tile layer, exactly today's
+      // blank-canvas behaviour (a strict addition, never a regression).
+      try {
+        const res = await fetch("/tiles/manifest.json");
+        if (!cancelled && res.ok) {
+          const manifest = (await res.json()) as TileManifest;
+          const [south, west, north, east] = manifest.bounds;
+          const bounds = L.latLngBounds([south, west], [north, east]);
+          tileLayerRef.current = L.tileLayer("/tiles/{z}/{x}/{y}.png", {
+            minZoom: manifest.minZoom,
+            maxZoom: manifest.maxZoom,
+            tileSize: manifest.tileSize ?? 256,
+            bounds,
+            attribution: manifest.attribution ?? "",
+            // A missing individual tile (e.g. edge of coverage) should render
+            // as transparent, not a broken-image icon.
+            errorTileUrl: "",
+          }).addTo(map);
+          setHasOfflineBasemap(true);
+          if (!userPosition && !targetLocation) map.fitBounds(bounds);
+        }
+      } catch {
+        // No manifest, or it's malformed — fall back to the tile-less map.
+      }
     })();
 
     return () => {
@@ -234,63 +319,107 @@ export default function MapNavigationModal({
         const colour = wp.type === "danger" ? "#f97316"
                      : wp.type === "water"  ? "#06b6d4"
                      : wp.type === "camp"   ? "#a78bfa"
+                     : wp.type === "sos"    ? "#ef4444"
                      : "#6b7280";
         const icon = L.divIcon({
           className: "",
           html: `<div style="width:14px;height:14px;background:${colour};border:2px solid white;border-radius:50%;"></div>`,
           iconSize: [14, 14], iconAnchor: [7, 7],
         });
-        const marker = L.marker([wp.location.lat, wp.location.lng], { icon })
+        const marker = L.marker([wp.lat, wp.lng], { icon })
           .addTo(mapRef.current!)
           .bindPopup(wp.name);
-        marker.on("click", () =>
-          setDestination({ lat: wp.location.lat, lng: wp.location.lng }),
-        );
+        marker.on("click", () => {
+          if (onNavigateWaypoint) onNavigateWaypoint(wp);
+          else setDestination({ lat: wp.lat, lng: wp.lng });
+        });
         waypointLayersRef.current.push(marker);
       });
     });
-  }, [mapReady, waypoints]);
+  }, [mapReady, waypoints, onNavigateWaypoint]);
+
+  // ── [STEP 12] Draw every contact's last-known location on the map ────────
+  // The map is the primary visualization for any shared location, not just
+  // saved waypoints — a contact with a `location` (from a location request/
+  // response, live share, or an SOS ping) gets a marker here too, distinct
+  // in colour/shape from waypoint pins so the two aren't confused.
+  useEffect(() => {
+    if (!mapReady || !mapRef.current) return;
+    import("leaflet").then((L) => {
+      if (!mapRef.current) return;
+      contactLayersRef.current.forEach((l) => mapRef.current!.removeLayer(l));
+      contactLayersRef.current = [];
+
+      (contacts ?? []).forEach((c) => {
+        if (!c.location) return;
+        const online = c.reachability === "online";
+        const icon = L.divIcon({
+          className: "",
+          html: `<div style="width:16px;height:16px;background:#3b82f6;border:2px solid ${online ? "#34d399" : "#9ca3af"};border-radius:4px;box-shadow:0 0 6px #3b82f666;"></div>`,
+          iconSize: [16, 16], iconAnchor: [8, 8],
+        });
+        // [STEP 12] Hop-count shown right in the popup — item 8's "indicate
+        // the communication path" requirement, at the level of detail the
+        // firmware actually tracks (hop count, not the literal relay chain).
+        const hopLabel = c.signalHopDistance === undefined
+          ? ""
+          : c.signalHopDistance === 0
+          ? " · direct"
+          : ` · ${c.signalHopDistance} hop${c.signalHopDistance > 1 ? "s" : ""} via relay`;
+        const marker = L.marker([c.location.lat, c.location.lng], { icon })
+          .addTo(mapRef.current!)
+          .bindPopup(`${c.deviceName}${hopLabel}`);
+        marker.on("click", () => {
+          if (onNavigateContact) onNavigateContact(c);
+          else setDestination({ lat: c.location!.lat, lng: c.location!.lng });
+        });
+        contactLayersRef.current.push(marker);
+      });
+    });
+  }, [mapReady, contacts, onNavigateContact]);
+
+  // ── [STEP 11] Draw the active breadcrumb trail, if recording ─────────────
+  useEffect(() => {
+    if (!mapReady || !mapRef.current) return;
+    import("leaflet").then((L) => {
+      if (!mapRef.current) return;
+      if (trailLineRef.current) {
+        mapRef.current.removeLayer(trailLineRef.current);
+        trailLineRef.current = null;
+      }
+      if (!activeTrail || activeTrail.waypoints.length < 2) return;
+
+      const points = activeTrail.waypoints.map((wp): [number, number] => [wp.location.lat, wp.location.lng]);
+      trailLineRef.current = L.polyline(points, {
+        color: "#22c55e",
+        weight: 3,
+        opacity: 0.8,
+      }).addTo(mapRef.current);
+    });
+  }, [mapReady, activeTrail]);
 
   // ── Save waypoint at current destination ─────────────────────────────────
   const saveWaypoint = useCallback(() => {
     if (!destination) return;
-    const newWp: Waypoint = {
-      id:       Date.now().toString(),
-      name:     waypointName.trim() || "Waypoint",
-      location: { lat: destination.lat, lng: destination.lng, accuracy: 0 },
-      timestamp: new Date(),
-      type:     waypointType,
+    const newWp: NamedWaypoint = {
+      id:        Date.now().toString(),
+      name:      waypointName.trim() || "Waypoint",
+      lat:       destination.lat,
+      lng:       destination.lng,
+      type:      waypointType,
+      createdAt: new Date(),
     };
-    const trails = readTrails();
-    const active = trails.find((t) => t.active);
-    if (active) {
-      active.waypoints.push(newWp);
-      writeTrails(trails);
-      setWaypoints((prev) => [...prev, newWp]);
-    } else {
-      // Create a standalone trail to store the waypoint.
-      const trail = {
-        id: Date.now().toString(),
-        name: "Field Waypoints",
-        waypoints: [newWp],
-        startTime: new Date(),
-        totalDistance: 0,
-        active: true,
-      };
-      writeTrails([...trails, trail]);
-      setWaypoints((prev) => [...prev, newWp]);
-    }
+    const all = [...readWaypoints(), newWp];
+    writeWaypoints(all);
+    setWaypoints(all);
     setShowSaveForm(false);
     setWaypointName("");
   }, [destination, waypointName, waypointType]);
 
   const deleteWaypoint = useCallback((id: string) => {
-    const trails = readTrails().map((t) => ({
-      ...t,
-      waypoints: t.waypoints.filter((w) => w.id !== id),
-    }));
-    writeTrails(trails);
-    setWaypoints((prev) => prev.filter((w) => w.id !== id));
+    const remaining = readWaypoints().filter((w) => w.id !== id);
+    writeWaypoints(remaining);
+    setWaypoints(remaining);
   }, []);
 
   const centreOnUser = useCallback(() => {
@@ -308,6 +437,11 @@ export default function MapNavigationModal({
         <div className="flex items-center gap-2">
           <MapPin className="h-5 w-5 text-blue-400" />
           <h2 className="text-lg font-bold text-white">Navigation</h2>
+          {!hasOfflineBasemap && (
+            <span className="text-[10px] text-gray-500 border border-gray-700 rounded-full px-2 py-0.5">
+              no offline map installed
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-2">
           {userPosition && (
@@ -338,7 +472,8 @@ export default function MapNavigationModal({
             </div>
           </div>
         )}
-        {/* Dark background so the map space is clearly visible with no tiles */}
+        {/* Dark background so the map space is clearly visible even with no
+            offline basemap installed. */}
         {mapReady && (
           <style>{`
             .leaflet-container { background: #111827; }
@@ -402,7 +537,7 @@ export default function MapNavigationModal({
                 autoFocus
               />
               <div className="flex gap-1.5 flex-wrap">
-                {(["waypoint", "camp", "water", "danger", "interest"] as Waypoint["type"][]).map((t) => (
+                {(["waypoint", "camp", "water", "danger", "interest"] as NamedWaypoint["type"][]).map((t) => (
                   <button
                     key={t}
                     onClick={() => setWaypointType(t)}
@@ -441,8 +576,8 @@ export default function MapNavigationModal({
               <button
                 className="flex items-center gap-2 text-left flex-1"
                 onClick={() => {
-                  setDestination({ lat: wp.location.lat, lng: wp.location.lng });
-                  mapRef.current?.setView([wp.location.lat, wp.location.lng], 16);
+                  setDestination({ lat: wp.lat, lng: wp.lng });
+                  mapRef.current?.setView([wp.lat, wp.lng], 16);
                 }}
               >
                 <MapPin className="h-4 w-4 text-gray-400 flex-shrink-0" />

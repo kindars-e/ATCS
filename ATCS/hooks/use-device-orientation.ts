@@ -58,6 +58,19 @@ export default function useDeviceOrientation(_opts: UseDeviceOrientationOptions)
   // [STEP 9] Whether we successfully registered the absolute-orientation
   // event (true on Android 7+ with WebView 63+, false on older devices).
   const hasAbsoluteRef     = useRef(false);
+  // [STEP 11] Whether we have actually RECEIVED at least one genuine
+  // absolute (magnetic-north-referenced) event yet — distinct from
+  // hasAbsoluteRef, which only tracks whether we tried to register for one.
+  // Both `deviceorientationabsolute` and plain `deviceorientation` are
+  // registered below and BOTH fire on most Android devices. Before this fix,
+  // every relative event was still blended into the same EMA smoother as the
+  // absolute ones — but relative alpha is measured from an arbitrary,
+  // unrelated reference point, so the needle was effectively averaging two
+  // unrelated headings together on every sensor tick. That is what made the
+  // compass spin/point wrong even standing still. Once we've confirmed
+  // absolute events are actually arriving, relative events are ignored
+  // entirely instead of being fed into the smoother.
+  const hasReceivedAbsoluteRef = useRef(false);
 
   const checkCalibrationNeeded = useCallback((alpha: number) => {
     const buf = lastAlphaValues.current;
@@ -84,6 +97,7 @@ export default function useDeviceOrientation(_opts: UseDeviceOrientationOptions)
         rawHeading = event.webkitCompassHeading;
         setNeedsCalibration(false);
         setIsAbsolute(true);
+        hasReceivedAbsoluteRef.current = true;
       } else if (event.alpha !== null) {
         // ── Android path ─────────────────────────────────────────────────
         // [STEP 9] KEY FIX: `event.absolute === true` means this event
@@ -95,10 +109,16 @@ export default function useDeviceOrientation(_opts: UseDeviceOrientationOptions)
           rawHeading = (360 - event.alpha) % 360;
           setIsAbsolute(true);
           setNeedsCalibration(false);
+          hasReceivedAbsoluteRef.current = true;
         } else {
-          // Relative (fallback when absolute event not available): apply
-          // screen-orientation correction and show calibration warning since
-          // we can't guarantee accuracy.
+          // [STEP 11] Relative fallback — but ONLY use it if we have never
+          // received a genuine absolute event. Both listeners are registered
+          // unconditionally (see requestPermission below) and both fire on
+          // most Android devices; once absolute is confirmed working, a
+          // relative event here is measured from a different, arbitrary
+          // reference and must be discarded rather than blended in.
+          if (hasReceivedAbsoluteRef.current) return;
+
           checkCalibrationNeeded(event.alpha);
           const screenAngle = window.screen.orientation?.angle ?? 0;
           rawHeading = (360 - event.alpha + screenAngle) % 360;

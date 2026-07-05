@@ -21,19 +21,32 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   AlertTriangle, Check, Compass, Droplets, Edit3,
-  MapPin, Plus, Star, Tent, Trash2, X,
+  Map as MapIcon, MapPin, Plus, Radio, Square, Star, Tent, Trash2, X,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { calculateDistance } from "@/lib/geo";
 import { readWaypoints, writeWaypoints, type NamedWaypoint } from "@/lib/storage";
+import type { Trail } from "@/lib/types";
 
 interface WaypointManagerModalProps {
   userPosition: GeolocationPosition | null;
   /** Called when the user taps Navigate on a waypoint. */
   onNavigate: (wp: NamedWaypoint) => void;
+  /** [STEP 11] Switch to the offline map view. */
+  onOpenMap: () => void;
+  /** [STEP 11] Breadcrumb/trail recording — owned by the parent (fling-app)
+      so it keeps running across this modal opening/closing. */
+  isRecordingTrail: boolean;
+  activeTrail: Trail | null;
+  onStartRecording: (name?: string) => void;
+  onStopRecording: () => void;
   onClose: () => void;
+}
+
+function formatTrailDistance(m: number): string {
+  return m < 1000 ? `${Math.round(m)} m` : `${(m / 1000).toFixed(2)} km`;
 }
 
 const TYPE_ICONS: Record<NamedWaypoint["type"], React.ReactNode> = {
@@ -69,6 +82,11 @@ type View = "list" | "add-gps" | "add-manual" | "edit";
 export function WaypointManagerModal({
   userPosition,
   onNavigate,
+  onOpenMap,
+  isRecordingTrail,
+  activeTrail,
+  onStartRecording,
+  onStopRecording,
   onClose,
 }: WaypointManagerModalProps) {
   const [waypoints, setWaypoints]       = useState<NamedWaypoint[]>([]);
@@ -214,6 +232,44 @@ export function WaypointManagerModal({
       {/* ── LIST VIEW ─────────────────────────────────────────────────────── */}
       {view === "list" && (
         <>
+          {/* [STEP 11] Map + trail recording controls */}
+          <div className="px-4 pt-3 pb-1 flex items-center gap-2">
+            <button
+              onClick={onOpenMap}
+              className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm font-medium transition-colors"
+            >
+              <MapIcon className="h-4 w-4 text-blue-400" />
+              Open Map
+            </button>
+            {isRecordingTrail ? (
+              <button
+                onClick={onStopRecording}
+                className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl bg-red-900/40 border border-red-700/50 hover:bg-red-900/60 text-red-300 text-sm font-medium transition-colors"
+              >
+                <Square className="h-3.5 w-3.5 fill-current" />
+                Stop Trail
+              </button>
+            ) : (
+              <button
+                onClick={() => onStartRecording()}
+                disabled={!userPosition}
+                className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl bg-gray-800 hover:bg-gray-700 disabled:opacity-50 text-gray-300 text-sm font-medium transition-colors"
+              >
+                <Radio className="h-4 w-4 text-emerald-400" />
+                Record Trail
+              </button>
+            )}
+          </div>
+          {isRecordingTrail && activeTrail && (
+            <div className="mx-4 mb-1 px-3 py-2 rounded-xl bg-emerald-950/40 border border-emerald-800/50 flex items-center justify-between">
+              <span className="text-xs text-emerald-300 flex items-center gap-1.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                Recording — {activeTrail.waypoints.length} points
+              </span>
+              <span className="text-xs text-emerald-400">{formatTrailDistance(activeTrail.totalDistance)}</span>
+            </div>
+          )}
+
           {waypoints.length === 0 ? (
             <div className="flex-1 flex flex-col items-center justify-center gap-4 px-8 text-center">
               <MapPin className="h-12 w-12 text-gray-600" />

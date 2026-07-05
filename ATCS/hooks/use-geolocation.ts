@@ -31,8 +31,21 @@ interface UseGeolocationResult {
   permission: Permission;
   error: string | null;
   usingFallback: boolean;   // true when IP-based location is active
+  // [STEP 11] True from the moment GPS acquisition starts until either a
+  // fix reaches GPS_WARMUP_GOOD_ACCURACY_M or GPS_WARMUP_MAX_WAIT_MS elapses
+  // — whichever comes first. Consumer GPS chips commonly need several
+  // seconds after a cold start to converge on their steady-state accuracy;
+  // without this, the very first (often worst) fixes were fed straight into
+  // navigation math, which is exactly when users first open the compass.
+  // Callers should treat position as "not yet trustworthy for navigation"
+  // while this is true, even though a value is already present.
+  isWarmingUp: boolean;
   requestPermission: () => Promise<void>;
 }
+
+// [STEP 11] See isWarmingUp above.
+const GPS_WARMUP_GOOD_ACCURACY_M = 30;
+const GPS_WARMUP_MAX_WAIT_MS     = 6000;
 
 // [STEP 6] This product's whole premise is operating with ZERO internet —
 // the Ranger node's Wi-Fi hotspot has none by design. The IP-geolocation
@@ -89,26 +102,67 @@ async function getIpLocation(): Promise<GeolocationPosition | null> {
   return null;
 }
 
-// ── [FIX 2] EMA position smoother ────────────────────────────────────────────
-// When GPS accuracy is poor (>20 m) we blend the new reading with the previous
-// one using an Exponential Moving Average to reduce jumpiness.
-// α=0.6 means 60% new reading, 40% old.  When accuracy is good we use α=1.0
-// (no smoothing) so we react instantly to real movement.
-const EMA_ALPHA_POOR  = 0.6;   // used when accuracy > 20 m
-const EMA_ALPHA_GOOD  = 1.0;   // used when accuracy ≤ 20 m — no smoothing
+// ── [STEP 11] Position smoother ──────────────────────────────────────────────
+// [FIX 2]'s original version blended lat/lng with an EMA when accuracy was
+// poor, but built the returned position with `buildSyntheticPosition()` —
+// a helper meant only for the IP-geolocation fallback, which hardcodes
+// `accuracy: 5000`. That meant every time a real GPS fix's accuracy crossed
+// 20 m (common indoors or right after acquiring a fix), the displayed "GPS
+// accuracy" and every distance-vs-accuracy calculation downstream silently
+// switched to a fabricated 5000 m value that had nothing to do with the
+// actual fix. This is a direct, verified cause of "GPS accuracy becomes
+// unrealistic" reports. The fix below blends ONLY lat/lng (accuracy is a
+// radius, not a linear quantity — blending two accuracy numbers together
+// isn't physically meaningful anyway) and always reports the NEW fix's real
+// accuracy/altitude/heading/speed, never a fabricated placeholder.
+//
+// [STEP 11] Smoothing strength is also now a continuous function of accuracy
+// instead of a binary switch at exactly 20 m — the old on/off jump meant a
+// fix oscillating around that boundary got inconsistently smoothed from one
+// reading to the next.
+const SMOOTHING_GOOD_ACCURACY_M = 10;  // at/below this: trust the fix fully, no smoothing
+const SMOOTHING_POOR_ACCURACY_M = 50;  // at/above this: maximum smoothing
+const SMOOTHING_MAX_STRENGTH    = 0.6; // alpha floor at/above SMOOTHING_POOR_ACCURACY_M (60% old / 40% new)
+
+function smoothingAlphaFor(accuracy: number): number {
+  if (accuracy <= SMOOTHING_GOOD_ACCURACY_M) return 1.0; // no smoothing
+  if (accuracy >= SMOOTHING_POOR_ACCURACY_M) return 1.0 - SMOOTHING_MAX_STRENGTH;
+  const t = (accuracy - SMOOTHING_GOOD_ACCURACY_M) / (SMOOTHING_POOR_ACCURACY_M - SMOOTHING_GOOD_ACCURACY_M);
+  return 1.0 - t * SMOOTHING_MAX_STRENGTH;
+}
+
+function blendPosition(
+  prev: GeolocationPosition,
+  next: GeolocationPosition,
+  alpha: number,
+): GeolocationPosition {
+  const lat = alpha * next.coords.latitude  + (1 - alpha) * prev.coords.latitude;
+  const lng = alpha * next.coords.longitude + (1 - alpha) * prev.coords.longitude;
+  return {
+    coords: {
+      latitude:  lat,
+      longitude: lng,
+      // [STEP 11] Always the NEW fix's real accuracy — never fabricated.
+      accuracy: next.coords.accuracy,
+      altitude: next.coords.altitude,
+      altitudeAccuracy: next.coords.altitudeAccuracy,
+      heading: next.coords.heading,
+      speed: next.coords.speed,
+      toJSON() { return this; },
+    },
+    timestamp: next.timestamp,
+    toJSON() { return this; },
+  } as unknown as GeolocationPosition;
+}
 
 function smoothPosition(
   prev: GeolocationPosition | null,
   next: GeolocationPosition,
 ): GeolocationPosition {
   if (!prev) return next;
-
-  const alpha = next.coords.accuracy > 20 ? EMA_ALPHA_POOR : EMA_ALPHA_GOOD;
-  if (alpha === EMA_ALPHA_GOOD) return next; // good accuracy – use raw
-
-  const lat = alpha * next.coords.latitude  + (1 - alpha) * prev.coords.latitude;
-  const lng = alpha * next.coords.longitude + (1 - alpha) * prev.coords.longitude;
-  return buildSyntheticPosition(lat, lng);
+  const alpha = smoothingAlphaFor(next.coords.accuracy);
+  if (alpha >= 1.0) return next; // good accuracy – use raw, no smoothing needed
+  return blendPosition(prev, next, alpha);
 }
 
 export default function useGeolocation(
@@ -119,11 +173,38 @@ export default function useGeolocation(
   const [permission, setPermission] = useState<Permission>("prompt");
   const [error, setError] = useState<string | null>(null);
   const [usingFallback, setUsingFallback] = useState(false);
+  // [STEP 11] See isWarmingUp on UseGeolocationResult above.
+  const [isWarmingUp, setIsWarmingUp] = useState(true);
+  // [STEP 11] The getCurrentPosition/watchPosition success callbacks below
+  // are registered once (inside requestPermission, itself called once) and
+  // persist for the lifetime of the watch — they close over whatever
+  // `isWarmingUp` was at THAT moment and never see later state updates. A
+  // ref mirrors the state for the guard check inside noteFixForWarmup so it
+  // always reads the current value instead of a stale closure.
+  const isWarmingUpRef = useRef(true);
+  const setWarmingUp = (value: boolean) => {
+    isWarmingUpRef.current = value;
+    setIsWarmingUp(value);
+  };
 
   // [FIX 2] Keep previous position in a ref (not state) so the smoother can
   // access it without triggering extra re-renders.
   const prevPositionRef = useRef<GeolocationPosition | null>(null);
   const watchIdRef = useRef<number | null>(null);
+  // [STEP 11] When the current warm-up window started (reset each time
+  // requestPermission() is called fresh).
+  const warmupStartRef = useRef<number | null>(null);
+
+  // [STEP 11] Called with every real GPS fix (not the IP fallback, which is
+  // never going to "warm up" — it's a fixed low-precision value). Clears
+  // isWarmingUp the moment either condition is met.
+  const noteFixForWarmup = (pos: GeolocationPosition) => {
+    if (!isWarmingUpRef.current) return;
+    const elapsed = Date.now() - (warmupStartRef.current ?? Date.now());
+    if (pos.coords.accuracy <= GPS_WARMUP_GOOD_ACCURACY_M || elapsed >= GPS_WARMUP_MAX_WAIT_MS) {
+      setWarmingUp(false);
+    }
+  };
 
   useEffect(() => {
     return () => {
@@ -147,11 +228,20 @@ export default function useGeolocation(
         setPosition(ipPos);
         setPermission("granted");
         setUsingFallback(true);
+        // [STEP 11] IP-based location is a fixed, city-level estimate — it
+        // will never "warm up" to something better, so there's nothing to
+        // wait for.
+        setWarmingUp(false);
       } else {
         setError("Geolocation is not supported by this device");
+        setWarmingUp(false);
       }
       return;
     }
+
+    // [STEP 11] Reset the warm-up window for this fresh acquisition attempt.
+    setWarmingUp(true);
+    warmupStartRef.current = Date.now();
 
     try {
       // First, do a one-time getCurrentPosition to get a reading quickly
@@ -165,6 +255,7 @@ export default function useGeolocation(
             setPosition(smoothed);
             setUsingFallback(false);
             setError(null);
+            noteFixForWarmup(pos);
             resolve();
           },
           (err) => {
@@ -191,11 +282,14 @@ export default function useGeolocation(
           setPosition(smoothed);
           setUsingFallback(false);
           setError(null);
+          noteFixForWarmup(pos);
         },
         (err) => {
           if (err.code === err.PERMISSION_DENIED) setPermission("denied");
           setError(toError(err.code, err));
           setPosition(null);
+          // [STEP 11] An error means there's nothing left to warm up toward.
+          setWarmingUp(false);
         },
         {
           enableHighAccuracy: true,
@@ -223,8 +317,9 @@ export default function useGeolocation(
       } else {
         setError("Unable to determine location. Please check that location services are enabled.");
       }
+      setWarmingUp(false);
     }
   };
 
-  return { position, permission, error, usingFallback, requestPermission };
+  return { position, permission, error, usingFallback, isWarmingUp, requestPermission };
 }

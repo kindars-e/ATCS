@@ -144,8 +144,8 @@
 // be different on every physical node and MUST be 8 characters or
 // fewer (NODE_ID_LEN below) so it fits the fixed-size header field.
 // ════════════════════════════════════════════════════════════════════════
-#define THIS_DEVICE_ID  "Node1"          // ← Change per node (max 8 chars)
-#define WIFI_SSID       "ATCS-node 1"    // ← Must match THIS_DEVICE_ID suffix
+#define THIS_DEVICE_ID  "Node3"          // ← Change per node (max 8 chars)
+#define WIFI_SSID       "ATCS-node 3"    // ← Must match THIS_DEVICE_ID suffix
 #define WIFI_PASS       "atcs1234"
 
 // ════════════════════════════════════════════════════════════════════════
@@ -276,6 +276,21 @@
 // ── v5: SOS repeat reliability (kept from earlier firmware) ────────────
 #define SOS_TOTAL_SENDS       3    // 1 immediate + 2 extra resends
 #define SOS_REPEAT_GAP_MS   250    // base gap between resends (ms)
+
+// [STEP 12] HELLO repeat reliability. Root cause of "nodes go offline when
+// physically close" during idle periods: HELLO previously fired exactly
+// once per HELLO_INTERVAL_MS with no retransmission — unlike SOS's 3x
+// repeat, a single lost HELLO packet (routine on real RF, not just at
+// fringe range) directly cost a neighbor one of only 3 total chances within
+// NEIGHBOR_EXPIRY_MS (45s) to prove it's still alive, since
+// routeKeepaliveTick() deliberately skips direct-neighbor routes on the
+// assumption HELLO alone keeps them fresh. Giving HELLO the same
+// repeat-for-resilience treatment as SOS turns "3 unretried chances in 45s"
+// into "up to 9 chances in 45s" with no change to average airtime usage
+// pattern (still one beacon round per HELLO_INTERVAL_MS, just each round is
+// now burst-redundant).
+#define HELLO_TOTAL_SENDS     3    // 1 immediate + 2 extra resends
+#define HELLO_REPEAT_GAP_MS 400    // gap between resends (ms)
 
 // ── Battery-aware forwarding ─────────────────────────────────────────────
 // readBatteryPercent() is a stub — wire it to a real ADC voltage divider
@@ -671,6 +686,11 @@ uint8_t       sosRepeatBuf[MAX_PACKET_SIZE];  // raw mesh bytes of the last SOS,
 uint8_t       sosRepeatLen    = 0;
 
 unsigned long lastHelloAt = 0;
+// [STEP 12] HELLO repeat state — mirrors the SOS repeat mechanism above.
+int           helloRepeatsLeft = 0;
+unsigned long helloRepeatNext  = 0;
+uint8_t       helloRepeatBuf[MAX_PACKET_SIZE];
+uint8_t       helloRepeatLen   = 0;
 
 // [STEP 8] Battery sensing removed: no ADC/fuel-gauge hardware is wired,
 // so the previous 100% stub was actively misleading users. Forwarding is
@@ -713,7 +733,15 @@ bool addOrUpdateNeighbor(const char* id, int16_t rssi, float snr) {
       freeSlot = i;
     }
   }
-  if (freeSlot < 0) freeSlot = 0; // table genuinely full — overwrite oldest slot
+  if (freeSlot < 0) {
+    // [STEP 12] Table genuinely full of recently-heard-from, unexpired
+    // neighbors — evict the least recently heard rather than always slot 0.
+    int oldest = 0;
+    for (int i = 1; i < MAX_NEIGHBORS; i++) {
+      if (neighbors[i].lastHeard < neighbors[oldest].lastHeard) oldest = i;
+    }
+    freeSlot = oldest;
+  }
   neighbors[freeSlot].inUse     = true;
   strncpy(neighbors[freeSlot].id, id, NODE_ID_LEN); neighbors[freeSlot].id[NODE_ID_LEN] = '\0';
   neighbors[freeSlot].lastHeard = now;
@@ -753,7 +781,19 @@ void addOrUpdateRoute(const char* dest, const char* nextHop, uint8_t hopCount) {
     }
     if (!routes[i].valid && freeSlot < 0) freeSlot = i;
   }
-  if (freeSlot < 0) freeSlot = 0; // table full — overwrite oldest
+  if (freeSlot < 0) {
+    // [STEP 12] Evict the LEAST RECENTLY USED route instead of always slot 0.
+    // Opportunistic route learning now happens on every packet (see the
+    // generic addOrUpdateRoute call in handleReceivedPacket), so table
+    // pressure is higher than when this was written — blindly evicting
+    // slot 0 could silently discard a frequently-used route in favour of
+    // one just learned and maybe never used again.
+    int oldest = 0;
+    for (int i = 1; i < MAX_ROUTES; i++) {
+      if (routes[i].lastUsed < routes[oldest].lastUsed) oldest = i;
+    }
+    freeSlot = oldest;
+  }
   routes[freeSlot].valid    = true;
   strncpy(routes[freeSlot].dest, dest, NODE_ID_LEN); routes[freeSlot].dest[NODE_ID_LEN] = '\0';
   strncpy(routes[freeSlot].nextHop, nextHop, NODE_ID_LEN); routes[freeSlot].nextHop[NODE_ID_LEN] = '\0';
@@ -788,7 +828,18 @@ void markSeen(const char* src, uint16_t msgId) {
   for (int i = 0; i < MAX_SEEN; i++) {
     if (!seenCache[i].inUse) { freeSlot = i; break; }
   }
-  if (freeSlot < 0) freeSlot = 0; // full — overwrite oldest
+  if (freeSlot < 0) {
+    // [STEP 12] Evict the oldest dedup entry (by timestamp) instead of
+    // always slot 0. Prematurely evicting a still-relevant entry here means
+    // a genuine duplicate looks "fresh" again and gets re-delivered to the
+    // phone as if it were a new message — LRU eviction minimises how often
+    // that can happen under a busier mesh (more packet types, HELLO repeats).
+    int oldest = 0;
+    for (int i = 1; i < MAX_SEEN; i++) {
+      if (seenCache[i].ts < seenCache[oldest].ts) oldest = i;
+    }
+    freeSlot = oldest;
+  }
   seenCache[freeSlot].inUse = true;
   strncpy(seenCache[freeSlot].src, src, NODE_ID_LEN); seenCache[freeSlot].src[NODE_ID_LEN] = '\0';
   seenCache[freeSlot].msgId = msgId;
@@ -942,7 +993,17 @@ void sendHello() {
   // [STEP 8] payloadLen now 0 (battery removed)
   MeshHeader h = makeHeader(PKT_HELLO, BROADCAST_ID, PRIO_CONTROL, 0);
   h.ttl = 1; // HELLO is direct-neighbour-only — never forwarded
-  enqueuePacket(h, nullptr, true);
+
+  // [STEP 12] Queue the first copy, then arm the repeat mechanism (see
+  // HELLO_TOTAL_SENDS above) so this beacon round survives up to
+  // HELLO_TOTAL_SENDS-1 lost packets, not just zero.
+  uint8_t buf[MAX_PACKET_SIZE];
+  encodeHeader(h, buf);
+  enqueueRaw(buf, HEADER_SIZE, PRIO_CONTROL, true);
+  memcpy(helloRepeatBuf, buf, HEADER_SIZE);
+  helloRepeatLen   = HEADER_SIZE;
+  helloRepeatsLeft = HELLO_TOTAL_SENDS - 1;
+  helloRepeatNext  = millis() + HELLO_REPEAT_GAP_MS;
 }
 
 void sendRREQ(const char* dest) {
@@ -1301,6 +1362,24 @@ void handleReceivedPacket(const uint8_t* buf, int len, int16_t rssi, float snr) 
     doc["snr"]      = snr;
     String out; serializeJson(doc, out);
     wsBroadcast(out);
+  }
+
+  // [STEP 12] Opportunistically learn a route back to the ORIGINAL sender
+  // from ANY packet we handle, not just RREQ/DISCOVER/broadcast-DATA (which
+  // already each did this individually below). Every packet already carries
+  // (h.src, h.prevHop, h.hop) — h.hop is exactly how many hops this packet
+  // has travelled, so "reach h.src via h.prevHop in h.hop hops" is valid
+  // information the instant we see ANY packet, regardless of type. This
+  // makes routes to frequently-communicating nodes self-reinforcing from
+  // ordinary chat/ACK/NACK traffic instead of only from the narrow set of
+  // packet types that explicitly requested a route, and is specifically why
+  // a mid-path relay's PKT_NACK can now find its way back to the original
+  // sender in far more real-world cases (previously it required a route
+  // that only RREQ/DISCOVER/broadcast happened to have already established).
+  // Placed before the duplicate check (like the neighbor bookkeeping above)
+  // so even a retransmitted/duplicate packet keeps this route fresh.
+  if (h.hop >= 1) {
+    addOrUpdateRoute(h.src, h.prevHop, h.hop);
   }
 
   bool duplicate = hasSeen(h.src, h.msgId);
@@ -1744,6 +1823,13 @@ void loop() {
     enqueueRaw(sosRepeatBuf, sosRepeatLen, PRIO_SOS, true);
     sosRepeatsLeft--;
     sosRepeatNext = now + SOS_REPEAT_GAP_MS + random(120);
+  }
+
+  // [STEP 12] HELLO re-broadcast — same technique as the SOS repeat above.
+  if (helloRepeatsLeft > 0 && now >= helloRepeatNext) {
+    enqueueRaw(helloRepeatBuf, helloRepeatLen, PRIO_CONTROL, true);
+    helloRepeatsLeft--;
+    helloRepeatNext = now + HELLO_REPEAT_GAP_MS + random(100);
   }
 
   // ── Drain one packet from the priority send queue ──────────────────

@@ -120,7 +120,13 @@ export const PAIR_ACCEPT_SENTINEL   = "##PAIR_ACK##";
 // that won't actually help). The one exception is the automatic SOS location
 // ping, which always sends the best available fix regardless of accuracy —
 // during an emergency, an imprecise fix beats no fix at all.
-export const MAX_USEFUL_GPS_ACCURACY_M = 200;
+// [STEP 11] Tightened from 200 → 100. 200 m was loose enough to let fixes
+// through that were themselves comparable to a small town's worth of error —
+// exactly the kind of reading that shows up on the receiver's end as
+// nonsensical distance/bearing. 100 m is still generous enough that a
+// difficult environment (dense forest, canyon) isn't starved of updates
+// entirely, but no longer waves through the very worst fixes.
+export const MAX_USEFUL_GPS_ACCURACY_M = 100;
 
 // [STEP 6] Live share is now event-driven, not a fixed 3s interval:
 //   - a fresh fix is sent as soon as the responder has moved at least
@@ -131,11 +137,15 @@ export const MAX_USEFUL_GPS_ACCURACY_M = 200;
 // conditions — not how often we transmit.
 // [STEP 7] Thresholds tuned for real-world testing and demonstrations.
 // Old values (15 m / 30 s / 5 s) caused no visible updates when walking
-// slowly or in a small area. New values make location feel near-real-time:
-//   2 m movement threshold — triggers a send for any noticeable step
-//   10 s heartbeat  — requester sees a fresh fix at least every 10 s
-//   2 s check interval — evaluates movement every 2 s for quick response
-export const MIN_LOCATION_MOVE_M          = 2;
+// slowly or in a small area.
+// [STEP 11] MIN_LOCATION_MOVE_M raised 2 → 8 m. Consumer GPS jitters by
+// several metres even standing perfectly still, so a 2 m threshold was
+// crossed by pure noise almost every single check cycle — "stationary
+// detection" never actually triggered, and a standing-still peer kept
+// re-sending jittery near-duplicate fixes every ~2 s. 8 m sits above the
+// typical GPS noise floor while still being covered in a couple of seconds
+// at a normal walking pace, so real movement is still reported promptly.
+export const MIN_LOCATION_MOVE_M          = 8;
 export const LIVE_SHARE_HEARTBEAT_MS      = 10_000;
 export const LIVE_SHARE_CHECK_INTERVAL_MS = 2_000;
 
