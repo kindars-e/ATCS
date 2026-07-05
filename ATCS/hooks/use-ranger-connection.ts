@@ -63,7 +63,9 @@ export type RangerEvent =
   // WS frame and should be forwarded so recordNodeHeard() can update signal
   // quality when a location fix arrives — previously location responses
   // never refreshed the RSSI display because rssi wasn't threaded through.
-  | { kind: "location-response";  sender: string; lat: number; lng: number; accuracy: number; broadcast: boolean; rssi?: number; snr?: number }
+  // [STEP 10] seq: monotonic per-sender counter for stale-update protection
+  // (see lib/protocol.ts encodeLocationResponse).
+  | { kind: "location-response";  sender: string; lat: number; lng: number; accuracy: number; broadcast: boolean; rssi?: number; snr?: number; seq?: number }
   // [STEP 6] Live-share session explicitly ended by the responder.
   | { kind: "location-stop";      sender: string }
   | { kind: "frequency-update";   frequency: number }
@@ -311,6 +313,7 @@ export function useRangerConnection({
               lng:       decoded.lng,
               accuracy:  decoded.accuracy,
               broadcast: decoded.broadcast, // [STEP 6]
+              seq:       decoded.seq,       // [STEP 10]
               // [STEP 7] Forward the RSSI/SNR from the outer WS frame so
               // recordNodeHeard() can update signal quality on location-
               // response events, not only on text messages.

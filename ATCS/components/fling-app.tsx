@@ -203,6 +203,16 @@ export default function FlingApp() {
   const liveShareCheckTimerRef   = useRef<ReturnType<typeof setInterval> | null>(null);
   const liveShareTargetRef       = useRef<string | null>(null);
   const locationRequestTargetRef = useRef<Contact | null>(null);
+  // [STEP 10] Monotonic counter for every location fix WE send (one-time
+  // response or live-share update alike — both go through trySendPosition).
+  // Never reset; only ever incremented. Lets a receiver detect and drop a
+  // stale mesh retry that arrives after a newer fix already went through
+  // (the mesh transport retries failed sends end-to-end but gives no
+  // ordering guarantee across independent messages).
+  const myLocationSeqRef = useRef(0);
+  // [STEP 10] Last accepted seq PER SENDER, so an out-of-order/stale location
+  // update can be dropped before it overwrites a fresher one on screen.
+  const lastLocationSeqRef = useRef<Record<string, number>>({});
   // [STEP 6] Timeout handling for a one-time location request — fires if
   // the other side never responds.
   const locationRequestTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -588,7 +598,8 @@ export default function FlingApp() {
                   // any fix is better than none on an SOS — unlike normal
                   // sharing, this is never held back for poor accuracy.
                   const { latitude, longitude, accuracy } = pos.coords;
-                  sendFrame(encodeLocationResponse(EMERGENCY_BROADCAST_ID, latitude, longitude, accuracy));
+                  myLocationSeqRef.current += 1;
+                  sendFrame(encodeLocationResponse(EMERGENCY_BROADCAST_ID, latitude, longitude, accuracy, myLocationSeqRef.current));
                 },
                 () => { /* no GPS available — the SOS itself already went out; never block on this */ },
                 { enableHighAccuracy: true, timeout: 8000, maximumAge: 10000 },
@@ -716,6 +727,26 @@ export default function FlingApp() {
         // [STEP 7] Forward rssi/snr so signal quality is updated on every
         // location fix received, not only on text messages.
         recordNodeHeard(event.sender, event.rssi, event.snr);
+
+        // [STEP 10] Stale/out-of-order guard. The mesh transport retries a
+        // failed unicast send end-to-end but gives no ordering guarantee
+        // ACROSS independent sends — a retried older fix can legitimately
+        // arrive after a newer one already went through (e.g. after a route
+        // hiccup on a multi-hop path). Without this, that late retry would
+        // silently overwrite a fresher position on screen. A large BACKWARD
+        // jump (rather than a small one) is treated as the sender's app
+        // having restarted (its counter resets to 0) rather than a stale
+        // retry, so we don't get stuck permanently rejecting a peer's
+        // legitimately fresh fixes after they relaunch.
+        if (event.seq !== undefined) {
+          const prevSeq = lastLocationSeqRef.current[event.sender];
+          const RESET_JUMP = 5;
+          const isStaleRetry =
+            prevSeq !== undefined && event.seq <= prevSeq && (prevSeq - event.seq) < RESET_JUMP;
+          if (isStaleRetry) return;
+          lastLocationSeqRef.current[event.sender] = event.seq;
+        }
+
         const newLocation: ContactLocation = {
           lat:       event.lat,
           lng:       event.lng,
@@ -1228,7 +1259,8 @@ export default function FlingApp() {
         return false;
       }
 
-      const sent = sendFrame(encodeLocationResponse(session.targetId, latitude, longitude, accuracy));
+      myLocationSeqRef.current += 1;
+      const sent = sendFrame(encodeLocationResponse(session.targetId, latitude, longitude, accuracy, myLocationSeqRef.current));
       if (!sent) {
         setLocationDebugMessage("Connection issue — update not delivered.");
         return false;

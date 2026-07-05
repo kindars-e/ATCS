@@ -34,9 +34,17 @@
 //
 // LoRa DATA SENTINELS (embedded in message.data field):
 //   ##LREQ##                  – [STEP 6] requester asks for responder's GPS
-//   ##LRESP##lat,lng,acc      – [STEP 6] responder sends a GPS fix back (used
+//   ##LRESP##seq,lat,lng,acc  – [STEP 6] responder sends a GPS fix back (used
 //                               for both one-time responses and each live-share
-//                               update — same format either way)
+//                               update — same format either way). [STEP 10]
+//                               leading `seq` is a monotonically increasing
+//                               per-device counter (see encodeLocationResponse)
+//                               so a delayed mesh retry of an OLDER fix can
+//                               never visually overwrite a newer one that
+//                               already arrived — the mesh transport has no
+//                               ordering guarantee across independent sends,
+//                               only end-to-end retry, so a stale retry can
+//                               legitimately arrive after a fresher fix.
 //   ##LSTOP##                 – [STEP 6] responder explicitly ended a live
 //                               share session, so the requester can show
 //                               "stopped sharing" instead of silently going stale
@@ -100,7 +108,9 @@ export type DecodedMessage =
   | { kind: "location-request";  sender: string }
   // [STEP 6] broadcast: true when this fix arrived via the automatic
   // SOS location ping ("*" recipient) rather than a normal 1:1 share.
-  | { kind: "location-response"; sender: string; lat: number; lng: number; accuracy: number; broadcast: boolean }
+  // [STEP 10] seq is undefined only if a peer is somehow still on the old
+  // 3-field wire format; callers should treat "no seq" as "always accept."
+  | { kind: "location-response"; sender: string; lat: number; lng: number; accuracy: number; broadcast: boolean; seq?: number }
   // [STEP 6] The responder explicitly ended a live-share session.
   | { kind: "location-stop";     sender: string }
   // [NEW] Pairing handshake messages decoded from raw LoRa data fields.
@@ -128,12 +138,16 @@ export function decodeMessage(frame: {
   }
 
   if (data.startsWith(LOCATION_RESPONSE_SENTINEL)) {
-    const [latStr, lngStr, accStr] = data
-      .slice(LOCATION_RESPONSE_SENTINEL.length)
-      .split(",");
+    const parts = data.slice(LOCATION_RESPONSE_SENTINEL.length).split(",");
+    // [STEP 10] New format is "seq,lat,lng,acc" (4 fields). Tolerate the old
+    // 3-field "lat,lng,acc" format too (no seq) so this never hard-breaks —
+    // it just loses stale-update protection for that one message.
+    const hasSeq = parts.length >= 4;
+    const [latStr, lngStr, accStr] = hasSeq ? parts.slice(1) : parts;
     return {
       kind:      "location-response",
       sender,
+      seq:       hasSeq ? Number(parts[0]) : undefined,
       lat:       Number(latStr),
       lng:       Number(lngStr),
       accuracy:  Number(accStr) || 10,
@@ -182,16 +196,25 @@ export function encodeLocationRequest(recipient: string): OutgoingFrame {
 // A raw JS float can print 15+ significant digits; bounding the precision
 // keeps every location packet a predictable, minimal size on an already
 // bandwidth-constrained LoRa link.
+//
+// [STEP 10] `seq` is a monotonically increasing counter the CALLER maintains
+// (one per device, incremented on every location send it makes — see
+// myLocationSeqRef in fling-app.tsx). The mesh transport retries failed
+// unicast sends end-to-end but has no cross-message ordering guarantee, so a
+// retried OLDER fix can legitimately arrive after a newer one that already
+// went through. The receiver uses seq to drop any out-of-order arrival
+// instead of letting it visually overwrite a fresher position.
 export function encodeLocationResponse(
   recipient: string,
   lat:      number,
   lng:      number,
   accuracy: number,
+  seq:      number,
 ): OutgoingFrame {
   return {
     type: "send",
     recipient,
-    data: `${LOCATION_RESPONSE_SENTINEL}${lat.toFixed(6)},${lng.toFixed(6)},${Math.round(accuracy)}`,
+    data: `${LOCATION_RESPONSE_SENTINEL}${seq},${lat.toFixed(6)},${lng.toFixed(6)},${Math.round(accuracy)}`,
   };
 }
 

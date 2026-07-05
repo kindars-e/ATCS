@@ -180,20 +180,38 @@
 // RREQ already uses). NOT an ack-of-everyone-at-once flood: each node sends
 // exactly one of these, best-effort, with no retry of its own.
 #define PKT_SOS_ACK          8
+// [STEP 10] Relay-level failure signal. Sent by a MID-PATH relay (not the
+// final destination) back toward the original sender the moment it discovers
+// it has no route to forward a unicast DATA packet onward. Without this, the
+// sender only finds out a relay's route table has gone stale after burning a
+// full ACK_TIMEOUT_MS x MAX_SEND_RETRIES cycle waiting for a reply that was
+// never going to come. Best-effort: if the relay itself has no route back to
+// the original sender, it just can't tell them — the existing ACK-timeout
+// path is still the safety net, so this is a strict improvement, never a
+// regression.
+#define PKT_NACK             9
 
 // ── Priorities (higher number = sent first) ─────────────────────────────
 #define PRIO_NORMAL    0   // ordinary chat
 #define PRIO_CONTROL   1   // HELLO / RREQ / RREP / ACK / DISCOVER*
 #define PRIO_SOS       2   // emergency broadcast — always wins
 
-// ── Mesh sizing/timing (tuned for a small demo mesh, room to grow) ──────
+// ── Mesh sizing/timing ───────────────────────────────────────────────────
+// [STEP 10] Table sizes increased from the original "small demo mesh"
+// values. The old MAX_PENDING_ACK=4 / MAX_PENDING_ROUTE=2 in particular were
+// too small to hold live-location updates (sent every few seconds) at the
+// same time as chat traffic — once full, the oldest in-flight send's retry
+// tracking was silently overwritten and never retried again (this is why
+// "messages arrive but location updates do not" could happen under load).
+// ESP32 has ample RAM for these sizes (worst case here is roughly 8 KB
+// total across all the tables below, against 320+ KB of SRAM available).
 #define MESH_TTL_MAX            6     // max hops a packet may travel
-#define MAX_NEIGHBORS           8
-#define MAX_ROUTES              8
-#define MAX_SEEN                24    // de-duplication cache size
-#define MAX_OUTQUEUE             8     // pending-to-transmit slots
-#define MAX_PENDING_ACK          4     // our own unicast sends awaiting ACK
-#define MAX_PENDING_ROUTE        2     // sends waiting on route discovery
+#define MAX_NEIGHBORS          12
+#define MAX_ROUTES             12
+#define MAX_SEEN                40    // de-duplication cache size
+#define MAX_OUTQUEUE            14     // pending-to-transmit slots
+#define MAX_PENDING_ACK         10     // our own unicast sends awaiting ACK
+#define MAX_PENDING_ROUTE        4     // sends waiting on route discovery
 
 #define HELLO_INTERVAL_MS     15000   // how often we announce ourselves
 #define NEIGHBOR_EXPIRY_MS     45000   // forget a neighbour after this long
@@ -225,6 +243,35 @@
 #define JITTER_UNICAST_MAX_MS      60
 #define JITTER_FLOOD_MIN_MS        60
 #define JITTER_FLOOD_MAX_MS       300
+
+// [STEP 10] Best-effort collision avoidance beyond jitter alone. This
+// firmware's LoRa library exposes no true Clear-Channel-Assessment / RSSI-
+// while-idle primitive (only packetRssi()/packetSnr(), valid solely right
+// after a packet is actually received), so real listen-before-talk isn't
+// achievable without lower-level radio register access this library doesn't
+// expose. As the next best thing: if we JUST received a packet, the nodes
+// around us are statistically likely to be about to react to it too (ACK,
+// forward, RREP, SOS_ACK...) — so briefly hold off our own transmit rather
+// than keying up right into that likely burst. This is a real, honest
+// mitigation, not a substitute for true CCA.
+#define RX_QUIET_GUARD_MS          25
+
+// [STEP 10] How often we tell the phone "this neighbor is still alive" from
+// traffic OTHER than HELLO (see addOrUpdateNeighbor). Every received packet's
+// prevHop is, by definition, a direct 1-hop neighbor — but reporting that on
+// literally every packet during a busy flood would spam the WebSocket link
+// for no benefit, so this rate-limits it per neighbor.
+#define NEIGHBOR_REPORT_MIN_GAP_MS 3000
+
+// [STEP 10] Proactive route keepalive. A route that's about to go stale (but
+// was genuinely useful recently) is refreshed automatically via one more
+// RREQ, instead of silently expiring and only being rediscovered reactively
+// the next time the user happens to send something (or never, if nothing
+// ever does). ROUTE_KEEPALIVE_MARGIN_MS is how long before full expiry we
+// start trying; ROUTE_KEEPALIVE_TICK_MS bounds it to at most one refresh
+// probe per tick so this can never itself flood the channel.
+#define ROUTE_KEEPALIVE_MARGIN_MS  15000
+#define ROUTE_KEEPALIVE_TICK_MS     8000
 
 // ── v5: SOS repeat reliability (kept from earlier firmware) ────────────
 #define SOS_TOTAL_SENDS       3    // 1 immediate + 2 extra resends
@@ -466,6 +513,20 @@ LedState      stateAfterEmerg = LED_NORMAL;
 bool          yellowBlinkOn   = false;
 unsigned long yellowBlinkNext = 0;
 
+// [STEP 10] Non-blocking "activity flash" — replaces the old
+// `digitalWrite(HIGH); delay(20); digitalWrite(LOW)` pattern that used to run
+// on every single packet TX/RX. That blocked loop() for 20 ms each time,
+// which under bursty traffic (a flood + its relays + ACKs) delayed HELLO
+// beacons, ACK-timeout bookkeeping, and the outgoing queue itself. Now we
+// just record when the flash should end; ledUpdate() (already called every
+// loop() iteration) forces the LED on for that window and lets whatever
+// state it's actually in reassert itself immediately after.
+unsigned long yellowActivityUntil = 0;
+void flashActivityLed() {
+  digitalWrite(LED_YELLOW, HIGH);
+  yellowActivityUntil = millis() + 20;
+}
+
 void setLedState(LedState s) { requestedLedState = s; }
 
 void triggerGreenConfirm() {
@@ -549,6 +610,14 @@ void ledUpdate() {
       digitalWrite(LED_GREEN, greenShouldBeOn ? HIGH : LOW);
     }
   }
+
+  // [STEP 10] Non-blocking activity flash overlay (see flashActivityLed()).
+  // Forces the yellow LED on for a short window after any TX/RX; whichever
+  // state-specific logic above runs on the NEXT ledUpdate() call (this
+  // function runs every loop() iteration) reasserts the "real" state right
+  // after, so this never fights the scanning/warning blink patterns for more
+  // than one tick.
+  if (now < yellowActivityUntil) digitalWrite(LED_YELLOW, HIGH);
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -580,6 +649,14 @@ unsigned int  routeDiscoveries   = 0;
 // without resizing MAX_OUTQUEUE.
 unsigned int  pktDroppedQueueFull = 0;
 unsigned long lastMsgTime        = 0;
+// [STEP 10] Last time we received ANY LoRa packet — used for the RX-quiet
+// transmit guard (see RX_QUIET_GUARD_MS) and is a better collision-avoidance
+// signal than jitter alone.
+unsigned long lastRxAt           = 0;
+// [STEP 10] Throttles the proactive route-keepalive tick (see
+// ROUTE_KEEPALIVE_TICK_MS) so it can never send more than one refresh RREQ
+// per tick, regardless of how many routes are close to expiry at once.
+unsigned long lastRouteKeepaliveAt = 0;
 
 bool lastSosState  = HIGH;
 
@@ -607,15 +684,28 @@ bool forwardingAllowed() {
 // TABLE HELPERS
 // ════════════════════════════════════════════════════════════════════════
 
-void addOrUpdateNeighbor(const char* id, int16_t rssi, float snr) {
+// [STEP 10] Returns true when this is "new enough" news worth telling the
+// phone about (rate-limited per neighbor by NEIGHBOR_REPORT_MIN_GAP_MS — see
+// the caller in handleReceivedPacket). Also now seeds/refreshes a direct
+// (1-hop, nextHop == the neighbor itself) route entry every time we hear
+// from ANY neighbor, for ANY packet type — not just HELLO. Previously a
+// route to a destination existed ONLY after an RREQ/RREP/DISCOVER round
+// trip, so even a direct, physically-adjacent neighbor required a full route
+// discovery cycle before the very first message could go through. Since
+// prevHop is by definition always a direct 1-hop neighbor (it's whoever last
+// physically transmitted this packet to us over the air), this route is
+// always trustworthy the moment we hear from them.
+bool addOrUpdateNeighbor(const char* id, int16_t rssi, float snr) {
   unsigned long now = millis();
   int freeSlot = -1;
   for (int i = 0; i < MAX_NEIGHBORS; i++) {
     if (neighbors[i].inUse && strcmp(neighbors[i].id, id) == 0) {
+      bool shouldReport = (now - neighbors[i].lastHeard) >= NEIGHBOR_REPORT_MIN_GAP_MS;
       neighbors[i].lastHeard = now;
       neighbors[i].rssi = rssi;
       neighbors[i].snr  = snr;
-      return;
+      addOrUpdateRoute(id, id, 1);
+      return shouldReport;
     }
     if (!neighbors[i].inUse && freeSlot < 0) freeSlot = i;
     // Recycle the stalest expired entry if the table is full.
@@ -629,6 +719,8 @@ void addOrUpdateNeighbor(const char* id, int16_t rssi, float snr) {
   neighbors[freeSlot].lastHeard = now;
   neighbors[freeSlot].rssi      = rssi;
   neighbors[freeSlot].snr       = snr;
+  addOrUpdateRoute(id, id, 1);
+  return true; // a brand-new neighbor is always worth reporting immediately
 }
 
 // [STEP 8] setNeighborBattery() removed — no battery hardware.
@@ -762,6 +854,17 @@ bool enqueuePacket(const MeshHeader& h, const uint8_t* payload, bool isFlood) {
 // SOS-priority traffic always wins the slot first).
 void drainOutQueue() {
   unsigned long now = millis();
+
+  // [STEP 10] Best-effort collision avoidance: this library has no true
+  // Clear-Channel-Assessment primitive (see RX_QUIET_GUARD_MS above for why),
+  // so we approximate it — if we JUST received a packet, neighbours are
+  // statistically about to react to it too (forward/ACK/RREP/SOS_ACK), so we
+  // hold off keying up our own transmitter for a short guard window rather
+  // than transmitting straight into that likely burst. SOS-priority traffic
+  // still isn't blocked indefinitely — this is a short, fixed guard, not a
+  // queue-emptying stall.
+  if (now - lastRxAt < RX_QUIET_GUARD_MS) return;
+
   int best = -1;
   for (int i = 0; i < MAX_OUTQUEUE; i++) {
     if (!outQueue[i].inUse) continue;
@@ -780,7 +883,7 @@ void drainOutQueue() {
   LoRa.endPacket();
   pktSent++; // [STEP 7] renamed from msgSent — this counts ALL packets
 
-  digitalWrite(LED_YELLOW, HIGH); delay(20); digitalWrite(LED_YELLOW, LOW);
+  flashActivityLed(); // [STEP 10] non-blocking — was delay(20)
 
   outQueue[best].inUse = false;
 }
@@ -893,7 +996,21 @@ void addPendingAck(uint16_t msgId, const char* dest, const uint8_t* buf, uint8_t
   for (int i = 0; i < MAX_PENDING_ACK; i++) {
     if (!pendingAcks[i].inUse) { freeSlot = i; break; }
   }
-  if (freeSlot < 0) freeSlot = 0; // table full — overwrite oldest, best-effort
+  if (freeSlot < 0) {
+    // [STEP 10] Table genuinely full (all MAX_PENDING_ACK sends in flight at
+    // once — e.g. live-location updates arriving every few seconds while
+    // chat is also active). Previously this always overwrote slot 0
+    // unconditionally, silently abandoning retry tracking for whichever
+    // message happened to occupy it — even one freshly sent a moment ago.
+    // Instead, evict the entry closest to giving up anyway (fewest
+    // retriesLeft): it's already the least likely to still succeed, so a
+    // fresher send is never sacrificed for an already-struggling one.
+    int worst = 0;
+    for (int i = 1; i < MAX_PENDING_ACK; i++) {
+      if (pendingAcks[i].retriesLeft < pendingAcks[worst].retriesLeft) worst = i;
+    }
+    freeSlot = worst;
+  }
   pendingAcks[freeSlot].inUse             = true;
   pendingAcks[freeSlot].msgId             = msgId;
   strncpy(pendingAcks[freeSlot].dest, dest, NODE_ID_LEN); pendingAcks[freeSlot].dest[NODE_ID_LEN] = '\0';
@@ -952,7 +1069,17 @@ void addPendingRoute(const char* dest, const uint8_t* buf, uint8_t len, bool isR
   for (int i = 0; i < MAX_PENDING_ROUTE; i++) {
     if (!pendingRoutes[i].inUse) { freeSlot = i; break; }
   }
-  if (freeSlot < 0) freeSlot = 0;
+  if (freeSlot < 0) {
+    // [STEP 10] Same reasoning as addPendingAck() above: evict the discovery
+    // already closest to giving up (fewest attemptsLeft) instead of always
+    // clobbering slot 0, so a just-started discovery isn't sacrificed for
+    // one that's nearly out of retries anyway.
+    int worst = 0;
+    for (int i = 1; i < MAX_PENDING_ROUTE; i++) {
+      if (pendingRoutes[i].attemptsLeft < pendingRoutes[worst].attemptsLeft) worst = i;
+    }
+    freeSlot = worst;
+  }
   pendingRoutes[freeSlot].inUse             = true;
   strncpy(pendingRoutes[freeSlot].dest, dest, NODE_ID_LEN); pendingRoutes[freeSlot].dest[NODE_ID_LEN] = '\0';
   memcpy(pendingRoutes[freeSlot].buf, buf, len);
@@ -1012,6 +1139,40 @@ void flushPendingRouteFor(const char* dest) {
                     pendingRoutes[i].isRecoveryAttempt);
       enqueueRaw(pendingRoutes[i].buf, pendingRoutes[i].len, PRIO_NORMAL, false);
       pendingRoutes[i].inUse = false;
+    }
+  }
+}
+
+// [STEP 10] Proactive route keepalive/refresh.
+//
+// Previously a multi-hop route was refreshed ONLY by actual traffic
+// (lastUsed touched on every successful forward/send) or discovered fresh
+// via RREQ the next time a send had no route at all. Once a route went
+// unused past ROUTE_EXPIRY_MS it just silently expired — recovery then
+// depended entirely on the user (or app) doing something that happened to
+// trigger a fresh RREQ. If nothing did, the destination stayed "gone" until
+// the user noticed and manually re-scanned. This is why recovery could look
+// so unpredictable in the field ("sometimes reconnects, sometimes never").
+//
+// This tick proactively refreshes a route that's ABOUT to expire (but was
+// genuinely used recently — a real, wanted contact) via one more RREQ,
+// before it actually goes stale. Direct 1-hop routes are skipped — those are
+// already refreshed for free by addOrUpdateNeighbor() on any overheard
+// packet, so they never need this. Bounded to one probe per tick so this
+// can never itself flood the channel, no matter how many routes are close
+// to expiry at once.
+void routeKeepaliveTick() {
+  unsigned long now = millis();
+  if (now - lastRouteKeepaliveAt < ROUTE_KEEPALIVE_TICK_MS) return;
+  lastRouteKeepaliveAt = now;
+
+  for (int i = 0; i < MAX_ROUTES; i++) {
+    if (!routes[i].valid) continue;
+    if (routes[i].hopCount <= 1) continue; // direct neighbor — refreshed elsewhere for free
+    unsigned long age = now - routes[i].lastUsed;
+    if (age > (ROUTE_EXPIRY_MS - ROUTE_KEEPALIVE_MARGIN_MS) && age <= ROUTE_EXPIRY_MS) {
+      sendRREQ(routes[i].dest);
+      break; // one probe per tick — never floods the channel
     }
   }
 }
@@ -1086,6 +1247,26 @@ void sendSosAck(const char* dest, uint16_t msgId) {
   forwardUnicast(h, nullptr);
 }
 
+// [STEP 10] Relay-level failure signal. Called by a MID-PATH relay (never
+// the final destination) the instant it discovers it has no route to carry
+// a unicast DATA packet onward. Without this, the original sender only finds
+// out a relay's route table went stale after burning a full
+// ACK_TIMEOUT_MS x MAX_SEND_RETRIES cycle waiting for an ACK that was never
+// coming — this tells them right away instead, cutting failure/recovery
+// latency dramatically on a multi-hop path. Best-effort: unicast DATA
+// forwarding doesn't establish a reverse route the way broadcast/RREQ/
+// DISCOVER do, so if we (the relay) have no route back to originalSrc
+// either, forwardUnicast() just drops this silently — the sender's existing
+// ACK-timeout path is still the safety net either way, so this can only ever
+// help, never regress delivery.
+void sendNack(const char* originalSrc, uint16_t msgId, const char* failedDest) {
+  MeshHeader h = makeHeader(PKT_NACK, originalSrc, PRIO_CONTROL, NODE_ID_LEN);
+  h.msgId = msgId; // carries the ORIGINAL data message's id, like sendAck() does
+  uint8_t payload[NODE_ID_LEN];
+  writeId(payload, 0, failedDest); // tell the source WHICH destination failed
+  forwardUnicast(h, payload);
+}
+
 void handleReceivedPacket(const uint8_t* buf, int len, int16_t rssi, float snr) {
   if (len < HEADER_SIZE) return; // too short to be a valid mesh packet
 
@@ -1095,10 +1276,32 @@ void handleReceivedPacket(const uint8_t* buf, int len, int16_t rssi, float snr) 
 
   if (strcmp(h.src, THIS_DEVICE_ID) == 0) return; // our own echo — ignore
 
+  // [STEP 10] Also record this reception for the RX-quiet transmit guard —
+  // see RX_QUIET_GUARD_MS / drainOutQueue().
+  lastRxAt = millis();
+
   // Learn about whoever physically relayed this packet to us, from ANY
   // traffic we overhear (not just HELLO beacons) — "opportunistic"
   // neighbor discovery, much faster than waiting for the next beacon.
-  addOrUpdateNeighbor(h.prevHop, rssi, snr);
+  // [STEP 10] Previously the phone was only told "this neighbor is alive"
+  // when a HELLO specifically arrived, even though the firmware itself
+  // already knew about every neighbor from ANY packet's prevHop. HELLO has
+  // no retransmission redundancy (unlike SOS's 3x repeat), so a single lost
+  // 15s beacon could make a genuinely-reachable, physically-close neighbor
+  // flip to "offline" in the app despite other traffic proving it's alive.
+  // Now ANY received packet (rate-limited per neighbor) refreshes the
+  // phone's view too, since h.prevHop is always a direct 1-hop neighbor
+  // regardless of packet type.
+  bool freshNeighborNews = addOrUpdateNeighbor(h.prevHop, rssi, snr);
+  if (freshNeighborNews) {
+    doc.clear();
+    doc["type"]     = "neighbor";
+    doc["deviceId"] = h.prevHop;
+    doc["rssi"]     = rssi;
+    doc["snr"]      = snr;
+    String out; serializeJson(doc, out);
+    wsBroadcast(out);
+  }
 
   bool duplicate = hasSeen(h.src, h.msgId);
 
@@ -1120,15 +1323,8 @@ void handleReceivedPacket(const uint8_t* buf, int len, int16_t rssi, float snr) 
   switch (h.type) {
 
     case PKT_HELLO: {
-      // [STEP 8] Battery removed from HELLO payload.
-      // Relay RSSI/SNR to the phone — no new LoRa traffic.
-      doc.clear();
-      doc["type"]     = "neighbor";
-      doc["deviceId"] = h.src;
-      doc["rssi"]     = rssi;
-      doc["snr"]      = snr;
-      String out; serializeJson(doc, out);
-      wsBroadcast(out);
+      // [STEP 10] Neighbor liveness is now reported centrally above (for
+      // ANY packet type, not just HELLO) — nothing extra to do here.
       break; // TTL=1, never forwarded
     }
 
@@ -1208,7 +1404,13 @@ void handleReceivedPacket(const uint8_t* buf, int len, int16_t rssi, float snr) 
     case PKT_DATA: {
       bool broadcast = isBroadcastAddr(h.dst);
       bool forUs      = broadcast || strcmp(h.dst, THIS_DEVICE_ID) == 0;
-      if (!forUs) { forwardUnicast(h, payload); break; }
+      if (!forUs) {
+        // [STEP 10] If this relay has no route to carry the packet onward,
+        // tell the original sender right away instead of letting them find
+        // out only after a full ACK-timeout cycle.
+        if (!forwardUnicast(h, payload)) sendNack(h.src, h.msgId, h.dst);
+        break;
+      }
 
       char text[MAX_PAYLOAD + 1];
       memcpy(text, payload, h.payloadLen);
@@ -1255,6 +1457,34 @@ void handleReceivedPacket(const uint8_t* buf, int len, int16_t rssi, float snr) 
         doc["status"] = "sos_received";
         doc["from"]   = h.src; // which node confirmed receipt
         String out; serializeJson(doc, out); wsBroadcast(out);
+      } else {
+        forwardUnicast(h, payload);
+      }
+      break;
+    }
+
+    // [STEP 10] A mid-path relay just told us it has no route to our
+    // destination — react immediately instead of waiting out the full
+    // ACK-timeout/retry cycle for a reply that was never coming.
+    case PKT_NACK: {
+      if (strcmp(h.dst, THIS_DEVICE_ID) == 0) {
+        char failedDest[NODE_ID_LEN + 1];
+        readId(payload, 0, failedDest);
+        for (int i = 0; i < MAX_PENDING_ACK; i++) {
+          if (pendingAcks[i].inUse && pendingAcks[i].msgId == h.msgId &&
+              strcmp(pendingAcks[i].dest, failedDest) == 0) {
+            invalidateRoute(failedDest);
+            // Same one-recovery-cycle cap as the ACK-timeout path (see
+            // pendingAckTick()) — never rediscovers more than once per message.
+            if (!pendingAcks[i].isRecoveryAttempt) {
+              addPendingRoute(failedDest, pendingAcks[i].buf, pendingAcks[i].len, true);
+            } else {
+              reportDeliveryFailed(failedDest);
+            }
+            pendingAcks[i].inUse = false;
+            break;
+          }
+        }
       } else {
         forwardUnicast(h, payload);
       }
@@ -1505,6 +1735,7 @@ void loop() {
   // ── Reliability bookkeeping ────────────────────────────────────────
   pendingAckTick();
   pendingRouteTick();
+  routeKeepaliveTick(); // [STEP 10] proactive refresh before routes go stale
 
   // ── v5: SOS re-broadcast (raw mesh bytes, same msgId each repeat —
   //        receivers' dedup cache naturally absorbs the extras once
@@ -1550,7 +1781,7 @@ void loop() {
     int16_t rssi = LoRa.packetRssi();
     float   snr  = LoRa.packetSnr();
 
-    digitalWrite(LED_YELLOW, HIGH); delay(20); digitalWrite(LED_YELLOW, LOW);
+    flashActivityLed(); // [STEP 10] non-blocking — was delay(20)
 
     handleReceivedPacket(buf, n, rssi, snr);
   }
