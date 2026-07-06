@@ -38,7 +38,6 @@ import {
   Compass,
   Radio,
   Send,
-  Signal,
   Trash2,
   WifiOff,
   X,
@@ -447,19 +446,21 @@ export function ChatView({
                     <Trash2 className="h-5 w-5 text-red-400" />
                   </Button>
                 )}
+                {/* [STEP 15] This is the only location-related icon in the
+                    chat header now — a second "Navigate" icon here was
+                    redundant with it (and with Compass's own Map/Back
+                    controls), so it was removed. */}
                 {!isEmergency && (
                   <Button
                     variant="ghost"
                     size="icon"
                     onClick={onRequestLocation}
                     className="rounded-full hover:bg-gray-700"
+                    aria-label="Request to share location"
                   >
                     <Compass className="h-5 w-5 text-gray-300" />
                   </Button>
                 )}
-                <Button variant="ghost" size="icon" className="rounded-full hover:bg-gray-700">
-                  <Signal className="h-5 w-5 text-gray-300" />
-                </Button>
               </div>
             </div>
           )}

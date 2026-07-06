@@ -51,6 +51,13 @@
 
 "use client";
 
+// [STEP 13] Leaflet's own stylesheet was never imported anywhere in this
+// app — without it, Leaflet's map container, tile panes, and zoom controls
+// render broken/misaligned (a well-known Leaflet gotcha). This import pulls
+// it from the already-installed local `leaflet` package at BUILD TIME, into
+// this app's own bundled CSS — not a CDN, not a runtime network request.
+import "leaflet/dist/leaflet.css";
+
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
@@ -64,6 +71,7 @@ import {
 
 import { Button } from "@/components/ui/button";
 import { calculateBearing, calculateDistance } from "@/lib/geo";
+import { getDownloadedManifest, getDownloadedTileUrlTemplate } from "@/lib/offline-tiles";
 import { readWaypoints, writeWaypoints, type NamedWaypoint } from "@/lib/storage";
 import type { Contact, Trail } from "@/lib/types";
 
@@ -82,6 +90,14 @@ interface MapNavigationModalProps {
   onNavigateWaypoint?: (wp: NamedWaypoint) => void;
   /** [STEP 12] Hand off a tapped contact marker to the Compass. */
   onNavigateContact?: (contact: Contact) => void;
+  /** [STEP 13] The real contact currently being navigated to, if any (as
+      opposed to a raw map-tap point or a plain saved waypoint) — unlocks the
+      same Beep/Compass-toggle actions the Compass screen has, so switching
+      between Map and Compass feels like one consistent
+      navigation session instead of two different tools. */
+  activeContact?: Contact | null;
+  onBeep?: (deviceId: string) => boolean;
+  onViewCompass?: () => void;
   onClose: () => void;
 }
 
@@ -112,8 +128,19 @@ export default function MapNavigationModal({
   contacts,
   onNavigateWaypoint,
   onNavigateContact,
+  activeContact,
+  onBeep,
+  onViewCompass,
   onClose,
 }: MapNavigationModalProps) {
+  const [isBeeping, setIsBeeping] = useState(false);
+  const handleBeep = () => {
+    if (activeContact && onBeep?.(activeContact.deviceId)) {
+      setIsBeeping(true);
+      setTimeout(() => setIsBeeping(false), 1000);
+    }
+  };
+
   const mapContainerRef = useRef<HTMLDivElement>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const mapRef          = useRef<any>(null);
@@ -160,14 +187,13 @@ export default function MapNavigationModal({
     (async () => {
       try {
         L = (await import("leaflet")) as typeof import("leaflet");
-        // Patch default marker icons (Leaflet's asset path breaks in bundlers).
-        // @ts-expect-error _getIconUrl is internal
-        delete L.Icon.Default.prototype._getIconUrl;
-        L.Icon.Default.mergeOptions({
-          iconRetinaUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png",
-          iconUrl:       "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png",
-          shadowUrl:     "https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png",
-        });
+        // [STEP 13] Removed the old default-marker-icon patch that pointed
+        // at unpkg.com — a real internet dependency that had no business in
+        // an offline-first app. It was also entirely dead code: every single
+        // marker created in this file (user, destination, waypoints,
+        // contacts) already passes its own custom L.divIcon, so Leaflet's
+        // built-in default icon (the only thing that patch affected) is
+        // never actually used.
       } catch {
         return; // Leaflet not available
       }
@@ -194,20 +220,37 @@ export default function MapNavigationModal({
         setDestination({ lat, lng });
       });
 
-      // [STEP 11] Look for a bundled offline tile package. This is a
-      // same-origin fetch of a static asset shipped inside the app bundle —
-      // not a network request — so it works identically with zero
-      // connectivity. Absent manifest = no tile layer, exactly today's
-      // blank-canvas behaviour (a strict addition, never a regression).
+      // [STEP 17] Prefer a downloaded tile package (see lib/offline-tiles.ts)
+      // over the small bundled sample — same manifest convention either way,
+      // just a different source: local app storage (via Capacitor
+      // convertFileSrc) if a download has completed, otherwise the tiny
+      // same-origin package baked into the APK (`public/tiles/`), which
+      // remains the permanent, zero-setup floor. Either way this never makes
+      // a live network request — both sources are already on the device.
       try {
-        const res = await fetch("/tiles/manifest.json");
-        if (!cancelled && res.ok) {
-          const manifest = (await res.json()) as TileManifest;
+        const downloadedTemplate = await getDownloadedTileUrlTemplate();
+        const manifest = downloadedTemplate
+          ? await getDownloadedManifest()
+          : await fetch("/tiles/manifest.json").then((r) => (r.ok ? r.json() : null)) as TileManifest | null;
+        const urlTemplate = downloadedTemplate ?? "/tiles/{z}/{x}/{y}.png";
+
+        if (!cancelled && manifest) {
           const [south, west, north, east] = manifest.bounds;
           const bounds = L.latLngBounds([south, west], [north, east]);
-          tileLayerRef.current = L.tileLayer("/tiles/{z}/{x}/{y}.png", {
-            minZoom: manifest.minZoom,
-            maxZoom: manifest.maxZoom,
+          tileLayerRef.current = L.tileLayer(urlTemplate, {
+            // [STEP 14] `maxZoom` here is the layer's VISIBLE range, not just
+            // its native tile resolution — a plain L.tileLayer with
+            // maxZoom set to the manifest's actual max (e.g. 15) goes blank
+            // the moment the map zooms past it (the default open zoom is 16,
+            // "centre on me" is 17), which is exactly the blank-map bug this
+            // fixes. Keep the layer visible across the whole map zoom range
+            // and let minNativeZoom/maxNativeZoom tell Leaflet to reuse
+            // (upscale/downscale) the nearest real tile beyond that range,
+            // instead of requesting tiles that don't exist in the bundle.
+            minZoom: 0,
+            maxZoom: 22,
+            minNativeZoom: manifest.minZoom,
+            maxNativeZoom: manifest.maxZoom,
             tileSize: manifest.tileSize ?? 256,
             bounds,
             attribution: manifest.attribution ?? "",
@@ -370,8 +413,14 @@ export default function MapNavigationModal({
           .addTo(mapRef.current!)
           .bindPopup(`${c.deviceName}${hopLabel}`);
         marker.on("click", () => {
-          if (onNavigateContact) onNavigateContact(c);
-          else setDestination({ lat: c.location!.lat, lng: c.location!.lng });
+          // [STEP 13] Always show the destination card in the map itself
+          // (bearing/distance + Beep/Compass-toggle, once the parent
+          // echoes this contact back as `activeContact`) instead
+          // of forcing an immediate jump to the Compass screen — tapping a
+          // contact should feel the same as tapping a waypoint, staying in
+          // whichever view the user is already in.
+          setDestination({ lat: c.location!.lat, lng: c.location!.lng });
+          onNavigateContact?.(c);
         });
         contactLayersRef.current.push(marker);
       });
@@ -524,6 +573,36 @@ export default function MapNavigationModal({
               </button>
             </div>
           </div>
+
+          {/* [STEP 13] Contact actions — Beep / switch to Compass. Only
+              shown when navigating to a real contact (not a raw map-tap
+              point or a plain saved waypoint), and styled to match the
+              Compass screen's own action row so switching between the two
+              feels like one consistent navigation session. */}
+          {activeContact && (
+            <div className="flex items-center gap-2 mb-2">
+              {onViewCompass && (
+                <button
+                  onClick={onViewCompass}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-gray-300 text-xs font-medium rounded-lg transition-colors"
+                >
+                  <Compass className="h-3.5 w-3.5 text-blue-400" />
+                  Compass
+                </button>
+              )}
+              {onBeep && (
+                <button
+                  onClick={handleBeep}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg transition-colors ${
+                    isBeeping ? "bg-yellow-500/20 text-yellow-400" : "bg-gray-800 hover:bg-gray-700 text-gray-300"
+                  }`}
+                >
+                  <Navigation className={`h-3.5 w-3.5 ${isBeeping ? "text-yellow-400 animate-pulse" : "text-blue-400"}`} />
+                  {isBeeping ? "Beeping…" : "Find"}
+                </button>
+              )}
+            </div>
+          )}
 
           {/* Save form */}
           {showSaveForm && (

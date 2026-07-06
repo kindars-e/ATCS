@@ -21,7 +21,7 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   AlertTriangle, Check, Compass, Droplets, Edit3,
-  Map as MapIcon, MapPin, Plus, Radio, Square, Star, Tent, Trash2, X,
+  MapPin, Plus, Radio, Square, Star, Tent, Trash2, X,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -34,8 +34,6 @@ interface WaypointManagerModalProps {
   userPosition: GeolocationPosition | null;
   /** Called when the user taps Navigate on a waypoint. */
   onNavigate: (wp: NamedWaypoint) => void;
-  /** [STEP 11] Switch to the offline map view. */
-  onOpenMap: () => void;
   /** [STEP 11] Breadcrumb/trail recording — owned by the parent (fling-app)
       so it keeps running across this modal opening/closing. */
   isRecordingTrail: boolean;
@@ -82,7 +80,6 @@ type View = "list" | "add-gps" | "add-manual" | "edit";
 export function WaypointManagerModal({
   userPosition,
   onNavigate,
-  onOpenMap,
   isRecordingTrail,
   activeTrail,
   onStartRecording,
@@ -232,15 +229,8 @@ export function WaypointManagerModal({
       {/* ── LIST VIEW ─────────────────────────────────────────────────────── */}
       {view === "list" && (
         <>
-          {/* [STEP 11] Map + trail recording controls */}
+          {/* [STEP 11] Trail recording controls */}
           <div className="px-4 pt-3 pb-1 flex items-center gap-2">
-            <button
-              onClick={onOpenMap}
-              className="flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm font-medium transition-colors"
-            >
-              <MapIcon className="h-4 w-4 text-blue-400" />
-              Open Map
-            </button>
             {isRecordingTrail ? (
               <button
                 onClick={onStopRecording}

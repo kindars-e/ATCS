@@ -126,6 +126,11 @@ export interface NamedWaypoint {
   type: "waypoint" | "camp" | "water" | "danger" | "sos" | "interest";
   createdAt: Date;
   notes?: string;
+  /** [STEP 14] The real mesh device id behind this waypoint, when it came
+      from an actual node (e.g. an SOS location) rather than a manually
+      placed pin — lets navigation still offer Beep for a real "node in
+      trouble", not just a static coordinate. */
+  sourceDeviceId?: string;
 }
 
 export function readWaypoints(): NamedWaypoint[] {

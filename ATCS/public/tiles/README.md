@@ -1,15 +1,20 @@
-# Offline map tiles
+# Offline map tiles — the permanent floor
 
-**A real tile package is currently bundled here: central Dodoma, Tanzania**
+**A small real tile package is bundled here: central Dodoma, Tanzania**
 (the project's active field-test area), bounds
 `[-6.21, 35.69, -6.12, 35.80]`, zoom 12–15, 142 tiles, ~1.2 MB total. It was
 fetched one time from `tile.openstreetmap.org` with a descriptive User-Agent
 and a rate limit well under OSM's usage-policy ceiling — deliberately small
-in scope (a demo/prototype area, not a wide production release). **If you
-ship this app widely or cover a large area, replace this with tiles sourced
-properly** (a Geofabrik extract + your own renderer, or a licensed
-commercial tile provider) rather than relying on OSM's shared tile server —
-see "How to generate a tile set" below.
+in scope (a demo/prototype area, not a wide production release).
+
+**[STEP 17] This folder is deliberately kept tiny on purpose.** It's the
+permanent, zero-setup floor: guaranteed present from the very first launch,
+with no download step and no dependency on ever having internet. The *real*
+basemap for actual field use is a much larger package the app downloads for
+itself once — see `../../tile-packages/README.md` and
+`../../lib/offline-tiles.ts` — this folder is only what's left if that
+download has never happened (e.g. the very first launch, before the device
+has ever had internet).
 
 If this folder is ever emptied, the in-app map
 (`components/map-navigation-modal.tsx`) gracefully falls back to a plain
@@ -56,9 +61,21 @@ inside the app bundle, so its size directly adds to the installed app size.
 A single reserve/park at zoom 12–17 is typically tens of MB; an entire
 country at zoom 20 would not be practical.
 
-## Why the app doesn't just download tiles itself
+## Why this folder alone isn't the real solution
 
-The entire point of this system is to keep working with zero internet
-access in the field — the Ranger mesh node's own Wi-Fi hotspot has no
-internet by design. Any tile source that requires a live network call would
-simply fail every time it's actually needed.
+The entire point of the map is to keep working with zero internet access in
+the field — the Ranger mesh node's own Wi-Fi hotspot has no internet by
+design. A tile source that requires a live network call in the field would
+simply fail every time it's actually needed. But this folder ships inside
+the APK, so its size directly adds to the installed app size — it can only
+ever cover a small demo-scale area.
+
+**[STEP 17] The real basemap is downloaded once, ahead of time, instead.**
+The first time the app has any internet connection at all (ideally before
+it's ever taken into the field), it downloads a much larger tile package
+from this project's own GitHub repo — never a live OpenStreetMap server —
+and keeps it permanently in app-private storage. From then on the map is
+served entirely from that local copy, with zero network calls, for the
+whole real operating area rather than this folder's small demo box. See
+`../../tile-packages/README.md` for how that package is generated and
+hosted, and `../../lib/offline-tiles.ts` for the download/storage logic.

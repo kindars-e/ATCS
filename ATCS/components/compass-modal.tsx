@@ -45,18 +45,30 @@ import type { Contact } from "@/lib/types";
 interface CompassModalProps {
   contact: Contact;
   onBeep: (deviceId: string) => boolean;
-  /** Fully end navigation and reset session state. */
+  /** Fully end navigation and reset session state — used by the
+      error/edge-case screens below (offline contact, no location yet,
+      permission denied), and by the resume-banner's own X in fling-app.tsx. */
   onClose: () => void;
   /**
-   * [Step 9] Minimise the compass WITHOUT ending the session.
-   * When provided, the X button calls this instead of onClose,
-   * leaving the navigation session active in the background.
+   * [Step 9] Minimise the compass WITHOUT ending the session — hides the
+   * Compass UI so the user can do other things (text, browse contacts),
+   * while the navigation session stays alive in the background, resumable
+   * via the small banner. [STEP 16] This is what the main X button does —
+   * it must never fully end the session, only minimise it.
    */
   onMinimize?: () => void;
   /** [STEP 12] Switch to the map view for this same contact/waypoint —
       reuses the existing navigation architecture instead of a separate
-      location UI, per the map being the primary visualization throughout. */
+      location UI, per the map being the primary visualization throughout.
+      This is the dedicated Map button — a separate action from X/minimize,
+      with its own way back to Compass (the map's own Compass toggle). */
   onViewMap?: () => void;
+  /** [STEP 14] Real device id to target when Beep is tapped, for a
+      waypoint-sourced navigation that still represents an actual node (an
+      SOS location) rather than a manually placed pin (camp/water/etc, which
+      has nothing to beep). Falls back to the contact's own id for real
+      (non-waypoint) contacts. */
+  beepDeviceId?: string;
 }
 
 function formatAge(ms: number): string {
@@ -108,6 +120,7 @@ export function CompassModal({
   onClose,
   onMinimize,
   onViewMap,
+  beepDeviceId,
 }: CompassModalProps) {
   const {
     position: userPosition,
@@ -161,6 +174,11 @@ export function CompassModal({
   const targetLocation = contact.location;
   const isWaypoint     = contact.deviceId.startsWith("waypoint-");
   const isPcMode       = !hasDeviceOrientationSupport;
+  // [STEP 14] Beep is available whenever there's a real device behind this
+  // navigation — a live contact, or a waypoint that came from an actual node
+  // (e.g. an SOS location) — but not a manually placed pin (camp/water/
+  // danger/interest) with nothing to beep.
+  const beepTargetId = beepDeviceId ?? (!isWaypoint ? contact.deviceId : undefined);
 
   // ── [Step 9 — Issue 5] Offline check ──────────────────────────────────────
   const isContactOffline =
@@ -264,17 +282,18 @@ export function CompassModal({
     ? Math.min((locationAgeMs / 1000) * ASSUMED_MOVEMENT_SPEED_MPS, MAX_STALENESS_INFLATION_M)
     : 0;
   const targetAccuracy = displayTargetAccuracy !== null ? displayTargetAccuracy + staleInflationM : null;
-  const totalAccuracy  = myAccuracy !== null && targetAccuracy !== null
-    ? myAccuracy + targetAccuracy
-    : myAccuracy ?? null;
 
-  const distanceIsWithinAccuracy =
-    displayDistance !== null && totalAccuracy !== null && displayDistance < totalAccuracy;
-
-  // [STEP 12] "Arrived" — the estimated distance itself (not just relative
-  // to GPS error) is small enough that continuing to compute a precise
-  // bearing has no value; GPS error at this range exceeds the real distance
-  // by definition, so a spinning needle just invites misinterpretation.
+  // [STEP 15] "Arrived" is now a strict, deterministic check — within
+  // ARRIVAL_DISTANCE_M (2m) of the smoothed distance, full stop. A previous
+  // version also treated "GPS accuracy can't tell them apart" as arrived,
+  // to work around distance readings that were almost always inflated —
+  // but that was a heuristic covering for a real bug (stale EMA smoothing
+  // state carried over from a PREVIOUSLY navigated-to contact/waypoint,
+  // since CompassModal was never remounted on target change — see the
+  // `key` prop on this component in fling-app.tsx). With that fixed, the
+  // smoothed distance is trustworthy on its own, so the heuristic — which
+  // could also false-positive "arrived" at real separations of 10-20m+ when
+  // GPS accuracy was merely poor — is removed rather than kept as a safety net.
   const hasArrived = displayDistance !== null && displayDistance < ARRIVAL_DISTANCE_M;
 
   const distanceInFeet   = displayDistance !== null ? Math.round(displayDistance * 3.28084) : 0;
@@ -287,32 +306,11 @@ export function CompassModal({
       }
       const dirs = ["N","NE","E","SE","S","SW","W","NW"];
       const cardinal = dirs[Math.round(displayBearing / 45) % 8];
-      const distDisplay = distanceIsWithinAccuracy
-        ? `< ${Math.round(totalAccuracy!)} m`
-        : `${distanceInFeet} ft`;
-      return { value: distDisplay, unit: "", direction: `${displayBearing}° ${cardinal}` };
+      return { value: `${distanceInFeet} ft`, unit: "", direction: `${displayBearing}° ${cardinal}` };
     }
 
     if (displayBearing === null) {
       return { value: "--", unit: "ft", direction: "searching..." };
-    }
-
-    // [STEP 11] Close-range mode. Bearing-to-target computed from two
-    // independently-noisy GPS fixes gets LESS reliable the closer the two
-    // points are — a few metres of GPS jitter can swing the computed bearing
-    // by dozens of degrees once the real distance shrinks to GPS-error scale.
-    // Once we've already admitted the distance number itself is noise
-    // (distanceIsWithinAccuracy), showing a confident "slightly left" /
-    // "behind (right)" directional readout on TOP of that is actively
-    // misleading — this is exactly the "target behind (left), 224°, both
-    // standing beside each other" failure mode from field testing. Replace
-    // the false-precision direction text with an honest one instead.
-    if (distanceIsWithinAccuracy) {
-      return {
-        value:     `~${Math.round(totalAccuracy!)}`,
-        unit:      "ft",
-        direction: "nearby — look around",
-      };
     }
 
     let dir = "ahead";
@@ -330,10 +328,10 @@ export function CompassModal({
       unit:      "ft",
       direction: dir,
     };
-  }, [isPcMode, displayBearing, displayDistance, displayNeedle, distanceInFeet, distanceIsWithinAccuracy, totalAccuracy]);
+  }, [isPcMode, displayBearing, displayDistance, displayNeedle, distanceInFeet]);
 
   const handleBeep = () => {
-    if (onBeep(contact.deviceId)) {
+    if (beepTargetId && onBeep(beepTargetId)) {
       setIsBeeping(true);
       setTimeout(() => setIsBeeping(false), 1000);
     }
@@ -345,13 +343,16 @@ export function CompassModal({
     void requestGeoPermission();
   }, [permissionsRequested, requestGeoPermission]);
 
-  // Shared close/minimize: X button minimizes if possible, otherwise closes.
-  const handleDismiss = onMinimize ?? onClose;
+  // [STEP 16] X minimizes — hides Compass but keeps the nav session alive
+  // in the background (resumable via the small banner in fling-app.tsx) so
+  // the user can text/browse contacts/etc. It never fully ends the session;
+  // falls back to a full close only if no minimize handler was wired up.
+  const handleXPress = onMinimize ?? onClose;
 
   // Shared button row
   const ButtonRow = (
     <div className="w-full flex justify-between items-center mt-6 px-8">
-      <button onClick={handleDismiss} className="group relative">
+      <button onClick={handleXPress} className="group relative">
         <div className="absolute inset-0 bg-red-500 rounded-full opacity-0 group-hover:opacity-20 transition-opacity duration-200" />
         <div className="relative bg-gray-800/80 backdrop-blur-sm p-4 rounded-full border border-gray-700 transition-all group-hover:border-red-500/50 group-active:scale-95">
           <X className="w-6 h-6 text-gray-300 group-hover:text-red-400 transition-colors" />
@@ -377,7 +378,7 @@ export function CompassModal({
         <div className="w-16" />
       )}
 
-      {!isWaypoint ? (
+      {beepTargetId ? (
         <button onClick={handleBeep} className={`group relative transition-all ${isBeeping ? "animate-pulse" : ""}`}>
           <div className={`absolute inset-0 rounded-full transition-all duration-300 ${
             isBeeping ? "bg-yellow-500 opacity-30 blur-md animate-ping" : "bg-blue-500 opacity-0 group-hover:opacity-20"
@@ -419,7 +420,7 @@ export function CompassModal({
             Navigation paused. Last known location is preserved — you can resume
             once the contact comes back online.
           </p>
-          <Button onClick={handleDismiss} className="bg-gray-700 hover:bg-gray-600 px-8">
+          <Button onClick={onClose} className="bg-gray-700 hover:bg-gray-600 px-8">
             Dismiss
           </Button>
         </div>
@@ -436,9 +437,9 @@ export function CompassModal({
           <p className="text-gray-400 mb-8">
             Waiting for {contact.deviceName} to send their GPS position…
           </p>
-          <button onClick={handleDismiss}
+          <button onClick={onClose}
             className="bg-gray-800 text-gray-300 py-3 px-6 rounded-lg font-medium hover:bg-gray-700 transition-colors">
-            {onMinimize ? "Minimise" : "Close"}
+            Close
           </button>
         </div>
       </div>
@@ -457,9 +458,9 @@ export function CompassModal({
           <p className="text-gray-400 mb-8">
             Enable Motion & Orientation Access for this app in Settings.
           </p>
-          <button onClick={handleDismiss}
+          <button onClick={onClose}
             className="bg-gray-800 text-gray-300 py-3 px-6 rounded-lg font-medium hover:bg-gray-700 transition-colors">
-            {onMinimize ? "Minimise" : "Close"}
+            Close
           </button>
         </div>
       </div>
@@ -528,17 +529,20 @@ export function CompassModal({
 
         <div className="w-full flex flex-col items-center mb-8">
           <div className="bg-gray-800/80 backdrop-blur rounded-2xl px-8 py-4 border border-gray-700 text-center mb-6">
-            <div className="flex items-baseline justify-center gap-1">
-              <span className="text-5xl font-semibold">{distanceTexts.value}</span>
-              {distanceTexts.unit && <span className="text-3xl opacity-75 ml-1">{distanceTexts.unit}</span>}
-            </div>
-            <p className="text-2xl font-medium mt-1 text-blue-300">{distanceTexts.direction}</p>
-            {distanceInMeters > 0 && (
-              <p className="text-xs text-gray-500 mt-1">
-                {distanceIsWithinAccuracy
-                  ? `Within GPS error margin (±${Math.round(totalAccuracy!)} m)`
-                  : `${distanceInMeters} m away`}
-              </p>
+            {/* [STEP 13] Hidden once arrived — matches phone-compass mode;
+                showing a distance/direction readout under the "arrived"
+                circle would contradict it. */}
+            {!hasArrived && (
+              <>
+                <div className="flex items-baseline justify-center gap-1">
+                  <span className="text-5xl font-semibold">{distanceTexts.value}</span>
+                  {distanceTexts.unit && <span className="text-3xl opacity-75 ml-1">{distanceTexts.unit}</span>}
+                </div>
+                <p className="text-2xl font-medium mt-1 text-blue-300">{distanceTexts.direction}</p>
+                {distanceInMeters > 0 && (
+                  <p className="text-xs text-gray-500 mt-1">{distanceInMeters} m away</p>
+                )}
+              </>
             )}
             {locationAgeMs !== null && !isWaypoint && (
               <p className={`text-xs mt-1 ${isLost ? "text-red-400" : isStale ? "text-yellow-500" : "text-gray-500"}`}>
@@ -615,19 +619,17 @@ export function CompassModal({
         <div className="flex flex-col items-center">
           <div className="w-4 h-4 bg-blue-400 rounded-full shadow-lg shadow-blue-400/50 mb-2" />
           <div
-            className={distanceIsWithinAccuracy ? "opacity-30 transition-opacity duration-500" : "transition-opacity duration-500"}
             style={{
               transform: `rotate(${displayNeedle}deg)`,
               // [Step 9] Removed transition-transform entirely.
               // The EMA filter in use-device-orientation + NEEDLE_ALPHA above
               // provide all the visual smoothing needed. The old CSS transition
               // was re-triggering every 100ms → perpetual "chasing" animation.
-              // [STEP 11] Opacity IS allowed to transition (unlike rotation) —
-              // it's a one-off fade when entering/leaving close-range mode, not
-              // a per-sensor-tick animation, so it can't cause the old chasing
-              // bug. Dimmed because a needle claiming a precise bearing while
-              // we're simultaneously telling the user "the distance number is
-              // noise" is contradictory — see distanceTexts above.
+              // [STEP 13] The needle is never dimmed anymore — it's fully
+              // replaced by the "arrived" state above whenever GPS can't
+              // distinguish the distance (hasArrived now covers that case),
+              // so by the time this branch renders at all, the needle is
+              // always showing a bearing worth trusting.
             }}
           >
             <svg width="240" height="240" viewBox="0 0 24 24" fill="none">
@@ -648,13 +650,6 @@ export function CompassModal({
                 {distanceTexts.unit && <span className="text-3xl opacity-75 ml-1">{distanceTexts.unit}</span>}
               </div>
               <p className="text-3xl font-medium mt-1">{distanceTexts.direction}</p>
-
-              {/* [Step 9] Accuracy caveat when GPS error exceeds measured distance */}
-              {distanceIsWithinAccuracy && totalAccuracy !== null && (
-                <p className="text-xs text-amber-400 mt-1 text-center px-4">
-                  Within GPS error margin — actual distance unknown (±{Math.round(totalAccuracy)} m)
-                </p>
-              )}
             </>
           )}
 

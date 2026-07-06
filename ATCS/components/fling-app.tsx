@@ -71,6 +71,7 @@ import {
   encodePairAccept,
 } from "@/lib/protocol";
 import { calculateDistance } from "@/lib/geo";
+import { downloadTilePackage, getDownloadedManifest, type DownloadProgress } from "@/lib/offline-tiles";
 import { readContacts, writeContacts, readMessages, writeMessages } from "@/lib/storage";
 import type {
   Contact,
@@ -150,6 +151,11 @@ export default function FlingApp() {
   // opened from somewhere other than the Waypoints list (e.g. tapping an
   // SOS notice) — see openMapAt below.
   const [mapTargetLocation, setMapTargetLocation] = useState<{ lat: number; lng: number; label?: string } | null>(null);
+  // [STEP 13] The real contact currently being navigated to on the map, if
+  // any — unlocks the same Beep/Compass-toggle actions the Compass screen
+  // has. Kept in sync with currentContact so those actions
+  // (which read currentContact) always target the right person.
+  const [mapActiveContact, setMapActiveContact] = useState<Contact | null>(null);
   // [STEP 8] Live user GPS for passing into the map component. We use the
   // raw browser API here (not the hook) to keep this light — the hook's
   // watchPosition is reserved for live-share sessions.
@@ -175,6 +181,10 @@ export default function FlingApp() {
   // [Step 9 — Issue 2] Active navigation contact: set when compass opens,
   // persists when compass is minimised so the session can be resumed.
   const [activeNavContact, setActiveNavContact] = useState<Contact | null>(null);
+  // [STEP 14] Real device id to beep for the active nav session, when it's a
+  // waypoint-sourced navigation for an actual node (SOS) rather than a
+  // manually placed pin — see NamedWaypoint.sourceDeviceId.
+  const [activeNavBeepDeviceId, setActiveNavBeepDeviceId] = useState<string | undefined>(undefined);
 
   // [v6 RANGE DETECTION] Transient banner shown when a node's reachability
   // changes (e.g. "Ranger B is out of range"). Auto-clears after a few seconds.
@@ -202,6 +212,11 @@ export default function FlingApp() {
   // [STEP 6] Transient banner for location-session events (e.g. "X stopped
   // sharing their location") — same pattern as rangeNotice/deliveryNotice.
   const [locationNotice, setLocationNotice] = useState<string | null>(null);
+
+  // [STEP 17] One-time offline map tile download — see lib/offline-tiles.ts.
+  // null = not currently downloading (either not started, not needed yet, or
+  // finished); set while a download is actively in progress.
+  const [tileDownloadProgress, setTileDownloadProgress] = useState<DownloadProgress | null>(null);
 
   // [STEP 12] SOS mesh-confidence status (item 9). Unlike the other notice
   // banners (4-5s auto-dismiss), this is deliberately persistent — during an
@@ -385,6 +400,43 @@ export default function FlingApp() {
     document.addEventListener("click", fn);
     return () => document.removeEventListener("click", fn);
   }, [showDeleteMenu]);
+
+  // [STEP 17] One-time offline map tile download. Checks once on launch
+  // whether a full tile package is already on disk; if not and the device
+  // currently has internet, downloads it in the background (non-blocking —
+  // the rest of the app stays usable). If there's no internet yet, waits for
+  // the browser's `online` event and tries again then. Never retries once a
+  // download has actually completed.
+  useEffect(() => {
+    let cancelled = false;
+    let done = false;
+
+    const attempt = async () => {
+      if (done) return;
+      const existing = await getDownloadedManifest();
+      if (existing || cancelled) {
+        done = true;
+        return;
+      }
+      if (!navigator.onLine) return;
+
+      const ok = await downloadTilePackage((progress) => {
+        if (!cancelled) setTileDownloadProgress(progress);
+      });
+      if (cancelled) return;
+      setTileDownloadProgress(null);
+      done = ok;
+    };
+
+    void attempt();
+
+    const onOnline = () => void attempt();
+    window.addEventListener("online", onOnline);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("online", onOnline);
+    };
+  }, []);
 
   useEffect(() => {
     const t = setTimeout(() => setShowSplash(false), SPLASH_DURATION_MS);
@@ -649,13 +701,26 @@ export default function FlingApp() {
           !!myDeviceIdRef.current &&
           senderId === myDeviceIdRef.current;
 
+        // [STEP 13] The Emergency thread doubles as a general "broadcast to
+        // everyone" channel (per the design above) — NOT every message sent
+        // there is a real emergency. Both the auto-location follow-up and the
+        // SOS mesh-confidence banner used to fire on isOwnEcho alone, meaning
+        // typing an ordinary message in the Emergency thread silently blasted
+        // your GPS location and popped the "SOS Active" banner. Gate both on
+        // the content actually containing "SOS" — matching the firmware's
+        // own convention (it checks `strstr(text, "SOS")` to decide whether
+        // to flash the emergency LED) — so only a genuine SOS (the hardware
+        // button's fixed text, or the user literally typing "SOS") triggers
+        // either behaviour.
+        const isRealSos = isOwnEcho && event.content.includes("SOS");
+
         // [STEP 6] Automatically follow up our own emergency broadcast with
         // one best-effort GPS fix, broadcast the same way — no separate
         // request/approval round-trip needed during an actual emergency
         // (the sender may not be able to respond to a permission prompt).
         // Debounced per-sender so the firmware's 3x SOS resend (same
         // logical event, same msgId) can't trigger 3 separate broadcasts.
-        if (isOwnEcho) {
+        if (isRealSos) {
           const now = Date.now();
           if (now - lastSosLocationRef.current.at > SOS_LOCATION_DEBOUNCE_MS) {
             lastSosLocationRef.current = { sender: senderId, at: now };
@@ -845,6 +910,7 @@ export default function FlingApp() {
           setShowLocationRequest(false);
           setShowCompass(true);
           setActiveNavContact(locationRequestTargetRef.current); // [Step 9]
+          setActiveNavBeepDeviceId(undefined); // [STEP 14] real contact — no waypoint beep-target override
           setTimeout(() => setLocationDebugMessage(""), 2000);
         } else if (event.broadcast) {
           // [STEP 9] SOS auto-location: immediately save the sender's
@@ -854,30 +920,38 @@ export default function FlingApp() {
             ?.deviceName || `Ranger ${event.sender}`;
 
           const sosWaypoint: NamedWaypoint = {
-            id:        `sos-${event.sender}-${Date.now()}`,
-            name:      `SOS — ${senderName}`,
-            lat:       event.lat,
-            lng:       event.lng,
-            type:      "sos",
-            createdAt: new Date(),
-            notes:     `Emergency location from ${senderName}`,
+            id:             `sos-${event.sender}-${Date.now()}`,
+            name:           `SOS — ${senderName}`,
+            lat:            event.lat,
+            lng:            event.lng,
+            type:           "sos",
+            createdAt:      new Date(),
+            notes:          `Emergency location from ${senderName}`,
+            sourceDeviceId: event.sender,
           };
           const existing = readWaypoints().filter((w) => w.type !== "sos" || w.id.split("-")[1] !== event.sender);
           writeWaypoints([...existing, sosWaypoint]);
 
-          // [STEP 12] Tapping the notice now opens the map directly, centred
-          // on the SOS location — the map is the primary visualization for
-          // any shared location, not just something buried in Waypoints.
+          // [STEP 14] Tapping the notice opens Compass, same as every other
+          // navigation entry point (waypoints, chat header, requested
+          // locations) — the map is reached from there via its own icon,
+          // not as a separate doorway.
           locationNoticeActionRef.current = () => {
-            setMapTargetLocation({ lat: event.lat, lng: event.lng, label: sosWaypoint.name });
-            if (navigator.geolocation && mapGpsWatchIdRef.current === null) {
-              mapGpsWatchIdRef.current = navigator.geolocation.watchPosition(
-                (pos) => setUserGpsPosition(pos),
-                () => {},
-                { enableHighAccuracy: true, maximumAge: 0 },
-              );
-            }
-            setShowMap(true);
+            const sender = contactsRef.current.find((c) => c.deviceId === event.sender);
+            const navContact: Contact = sender ?? {
+              deviceId:        event.sender,
+              deviceName:      senderName,
+              frequency:       RADIO_FREQUENCY_HZ,
+              spreadingFactor: RADIO_SPREADING_FACTOR,
+              bandwidth:       RADIO_BANDWIDTH_HZ,
+              unreadCount:     0,
+              reachability:    "online",
+              location:        { lat: event.lat, lng: event.lng, accuracy: 0, timestamp: new Date() },
+            };
+            setCurrentContact(navContact);
+            setActiveNavContact(navContact);
+            setActiveNavBeepDeviceId(undefined); // [STEP 14] real device id already on navContact
+            setShowCompass(true);
           };
           setLocationNotice(`🆘 ${senderName} sent their location — tap to navigate`);
         }
@@ -894,6 +968,22 @@ export default function FlingApp() {
           || `Ranger ${event.sender}`;
         locationNoticeActionRef.current = null; // [STEP 12] purely informational, no tap action
         setLocationNotice(`${name} stopped sharing their location`);
+
+        // [STEP 13] If we're actively navigating to exactly the person who
+        // just stopped sharing, end that session automatically instead of
+        // just notifying and leaving the user navigating toward a location
+        // that's no longer being updated. Checks both Compass and Map since
+        // either can be the active navigation surface.
+        if (activeNavContact?.deviceId === event.sender) {
+          setShowCompass(false);
+          setActiveNavContact(null);
+          setActiveNavBeepDeviceId(undefined);
+        }
+        if (mapActiveContact?.deviceId === event.sender) {
+          setShowMap(false);
+          setMapActiveContact(null);
+          setMapTargetLocation(null);
+        }
         return;
       }
 
@@ -1058,7 +1148,12 @@ export default function FlingApp() {
     }
     // [NEW] resolveSenderName is stable (useCallback with []); contacts are read
     // via contactsRef so they are intentionally NOT a dependency here.
-  }, [upsertContact, resolveSenderName, recordNodeHeard]); // eslint-disable-line react-hooks/exhaustive-deps
+  // [STEP 13] activeNavContact/mapActiveContact added — the location-stop
+  // case reads them directly (not via a ref) to auto-close the matching
+  // navigation session. Safe to let this callback's identity change often:
+  // use-ranger-connection.ts consumes onEvent through onEventRef, which
+  // resyncs every render, so there's no stale-listener/resubscription cost.
+  }, [upsertContact, resolveSenderName, recordNodeHeard, activeNavContact, mapActiveContact]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const {
     connectionState,
@@ -1564,6 +1659,7 @@ export default function FlingApp() {
     };
     setCurrentContact(navContact);
     setActiveNavContact(navContact); // [Step 9]
+    setActiveNavBeepDeviceId(wp.sourceDeviceId); // [STEP 14]
     setShowCompass(true);
     setShowWaypoints(false);
     setShowMap(false); // [STEP 11] also close the map if navigation was triggered from there
@@ -1608,21 +1704,6 @@ export default function FlingApp() {
                 ? "Propagating through the mesh — waiting for confirmation…"
                 : `${sosStatus.confirmedBy.length} node${sosStatus.confirmedBy.length > 1 ? "s" : ""} confirmed receipt — help is reachable.`}
             </p>
-            <button
-              onClick={() => {
-                setShowMap(true);
-                if (navigator.geolocation && mapGpsWatchIdRef.current === null) {
-                  mapGpsWatchIdRef.current = navigator.geolocation.watchPosition(
-                    (pos) => setUserGpsPosition(pos),
-                    () => {},
-                    { enableHighAccuracy: true, maximumAge: 0 },
-                  );
-                }
-              }}
-              className="self-start text-xs font-medium text-red-200 hover:text-white underline underline-offset-2"
-            >
-              View responders on map
-            </button>
           </div>
         </div>
       )}
@@ -1674,6 +1755,30 @@ export default function FlingApp() {
           >
             <span className="h-2 w-2 rounded-full bg-blue-400" />
             {locationNotice}
+          </div>
+        </div>
+      )}
+
+      {/* [STEP 17] One-time offline map download progress — a quiet bottom
+          banner (deliberately separate from the top notice stack above, so
+          it never fights that stack's margin math) that just reports
+          progress. The download itself already runs regardless of whether
+          this is visible; there's nothing to tap or cancel. */}
+      {tileDownloadProgress && !showSplash && isWiFiConnected && (
+        <div className="fixed bottom-0 left-0 right-0 z-40 flex justify-center pb-4 px-4 pointer-events-none">
+          <div className="bg-gray-900/95 border border-gray-700 text-white text-xs px-4 py-2.5 rounded-xl shadow-lg flex items-center gap-3 max-w-xs w-full">
+            <span className="h-2 w-2 rounded-full bg-blue-400 animate-pulse flex-shrink-0" />
+            <div className="flex-1 min-w-0">
+              <p className="text-gray-300">
+                Downloading offline map… {Math.round((tileDownloadProgress.fetched / tileDownloadProgress.total) * 100)}%
+              </p>
+              <div className="mt-1.5 h-1 rounded-full bg-gray-700 overflow-hidden">
+                <div
+                  className="h-full bg-blue-500 transition-all"
+                  style={{ width: `${Math.round((tileDownloadProgress.fetched / tileDownloadProgress.total) * 100)}%` }}
+                />
+              </div>
+            </div>
           </div>
         </div>
       )}
@@ -1763,9 +1868,6 @@ export default function FlingApp() {
         <WaypointManagerModal
           userPosition={userGpsPosition}
           onNavigate={handleNamedWaypointNavigate}
-          // [STEP 11] Switch to the offline map without tearing down the
-          // shared GPS watch (Map needs userGpsPosition too).
-          onOpenMap={() => { setShowWaypoints(false); setShowMap(true); }}
           isRecordingTrail={breadcrumb.isRecording}
           activeTrail={breadcrumb.activeTrail}
           onStartRecording={breadcrumb.startRecording}
@@ -1792,15 +1894,33 @@ export default function FlingApp() {
           contacts={contacts}
           activeTrail={breadcrumb.activeTrail}
           onNavigateWaypoint={handleNamedWaypointNavigate}
+          // [STEP 13] Tapping a contact marker now stays in the map (showing
+          // the destination card + the same Beep/Compass actions Compass
+          // has) instead of forcing an immediate switch — matches how
+          // tapping a waypoint already behaves. currentContact is kept in
+          // sync so onBeep below always targets the right person.
           onNavigateContact={(contact) => {
             setCurrentContact(contact);
-            setActiveNavContact(contact);
+            setMapActiveContact(contact);
+          }}
+          activeContact={mapActiveContact}
+          onBeep={(deviceId) => sendFrame(encodeBeep(deviceId))}
+          onViewCompass={() => {
+            if (!mapActiveContact) return;
+            setActiveNavContact(mapActiveContact);
+            setActiveNavBeepDeviceId(undefined); // [STEP 14] real contact
             setShowCompass(true);
             setShowMap(false);
           }}
+          // [STEP 16] Closing the map is NOT the same as ending the nav
+          // session — it just stops looking at the map, same idea as X
+          // minimizing Compass. If a session is still active, the resume
+          // banner naturally reappears (activeNavContact is left alone);
+          // ending the session entirely is the resume banner's own X.
           onClose={() => {
             setShowMap(false);
             setMapTargetLocation(null);
+            setMapActiveContact(null);
             if (mapGpsWatchIdRef.current !== null) {
               navigator.geolocation?.clearWatch(mapGpsWatchIdRef.current);
               mapGpsWatchIdRef.current = null;
@@ -1934,9 +2054,9 @@ export default function FlingApp() {
         </div>
       )}
 
-      {/* [Step 9] Navigation resume pill — shown when a nav session is
-          active but the compass has been minimised. Tapping it reopens
-          the compass; the X ends the session completely. */}
+      {/* [STEP 16] Navigation resume pill — shown when a nav session is
+          active but the compass has been minimised (X pressed). Tapping the
+          text reopens the compass; the small X ends the session completely. */}
       {activeNavContact && !showCompass && (
         <div className="fixed top-14 left-0 right-0 z-40 flex justify-center px-4 pointer-events-auto">
           <div className="bg-blue-900/95 border border-blue-700 rounded-2xl px-4 py-2.5
@@ -1951,6 +2071,7 @@ export default function FlingApp() {
             <button
               onClick={() => {
                 setActiveNavContact(null);
+                setActiveNavBeepDeviceId(undefined);
                 resetAllLocationState();
               }}
               className="p-1 text-blue-400 hover:text-white flex-shrink-0"
@@ -1964,24 +2085,49 @@ export default function FlingApp() {
       {/* ── Compass / navigation ─────────────────────────────────────────── */}
       {showCompass && currentContact && (
         <CompassModal
+          // [STEP 15] Force a fresh instance per navigation TARGET (not just
+          // per render) — without this, switching from one contact/waypoint
+          // to another reused the same mounted CompassModal, and its
+          // internal EMA-smoothed distance/bearing refs carried over from
+          // the PREVIOUS target instead of resetting. That's what made two
+          // nodes standing right next to each other read as ~35m apart: the
+          // displayed distance was still blending toward the old target's
+          // (much larger) distance. A `key` on identity forces React to
+          // unmount/remount instead of reusing state across targets.
+          key={currentContact.deviceId}
           // [Step 9 — Issue 5] Pass the LIVE contact from the contacts array
           // (not the stale snapshot in currentContact) so the compass receives
           // real-time reachability updates from the range monitor.
           contact={contacts.find((c) => c.deviceId === currentContact.deviceId) ?? currentContact}
           onBeep={(deviceId) => sendFrame(encodeBeep(deviceId))}
-          // [Step 9 — Issue 2] Minimise: hides compass but keeps nav session.
+          beepDeviceId={activeNavBeepDeviceId}
+          // [STEP 16] X minimizes: hides Compass but keeps the session alive
+          // in the background — resumable via the small banner below.
           onMinimize={() => setShowCompass(false)}
-          // Explicit close: ends the session completely.
+          // Reachable from the offline-contact / no-location / permission-
+          // denied edge screens, and from the resume banner's own X below.
+          // A full teardown.
           onClose={() => {
             setShowCompass(false);
             setActiveNavContact(null);
+            setActiveNavBeepDeviceId(undefined);
             resetAllLocationState();
           }}
-          // [STEP 12] Switch to the map view for this same target.
+          // [STEP 12] Switch to the map view for this same target — a
+          // separate action from X/minimize, with its own way back to
+          // Compass (the map's own Compass-toggle button).
+          // [STEP 15] Also hides Compass itself — previously this only
+          // showed the map WITHOUT closing Compass, leaving both full-screen
+          // modals mounted at once (the actual cause of the "unstable"
+          // X/Map behaviour reported from the field).
           onViewMap={() => {
             const live = contacts.find((c) => c.deviceId === currentContact.deviceId) ?? currentContact;
             if (!live.location) return;
             setMapTargetLocation({ lat: live.location.lat, lng: live.location.lng, label: live.deviceName });
+            // [STEP 13] Carry the contact identity over so the map's action
+            // row (Beep/Compass-toggle) shows up too — not just the
+            // Compass's own waypoint-style destination pin.
+            if (!live.deviceId.startsWith("waypoint-")) setMapActiveContact(live);
             if (navigator.geolocation && mapGpsWatchIdRef.current === null) {
               mapGpsWatchIdRef.current = navigator.geolocation.watchPosition(
                 (pos) => setUserGpsPosition(pos),
@@ -1989,6 +2135,7 @@ export default function FlingApp() {
                 { enableHighAccuracy: true, maximumAge: 0 },
               );
             }
+            setShowCompass(false);
             setShowMap(true);
           }}
         />
