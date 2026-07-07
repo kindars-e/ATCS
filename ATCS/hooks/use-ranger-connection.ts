@@ -55,7 +55,9 @@ import type { ConnectionState, NodeStats } from "@/lib/types";
 export type RangerEvent =
   // [NEW] broadcast: true when this text arrived as a LoRa "*" broadcast
   // (an emergency message). The app routes broadcasts into the Emergency thread.
-  | { kind: "text";               sender: string; content: string; broadcast: boolean; rssi?: number; snr?: number }
+  // [STEP 19] hops/via: live mesh-routing status for this exact message —
+  // see the "message" IncomingFrame in lib/protocol.ts.
+  | { kind: "text";               sender: string; content: string; broadcast: boolean; rssi?: number; snr?: number; hops?: number; via?: string }
   | { kind: "location-request";   sender: string }
   // [STEP 6] broadcast: true when this arrived via the automatic SOS
   // location ping rather than a normal 1:1 share/live-share update.
@@ -65,7 +67,7 @@ export type RangerEvent =
   // never refreshed the RSSI display because rssi wasn't threaded through.
   // [STEP 10] seq: monotonic per-sender counter for stale-update protection
   // (see lib/protocol.ts encodeLocationResponse).
-  | { kind: "location-response";  sender: string; lat: number; lng: number; accuracy: number; broadcast: boolean; rssi?: number; snr?: number; seq?: number }
+  | { kind: "location-response";  sender: string; lat: number; lng: number; accuracy: number; broadcast: boolean; rssi?: number; snr?: number; seq?: number; hops?: number; via?: string }
   // [STEP 6] Live-share session explicitly ended by the responder.
   | { kind: "location-stop";      sender: string }
   | { kind: "frequency-update";   frequency: number }
@@ -79,7 +81,7 @@ export type RangerEvent =
   | { kind: "sos-delivered";      from: string }
   // [STEP 4A] hops: how many mesh hops away the discovered node is.
   // [STEP 8] battery removed from both events.
-  | { kind: "node-discovered";    deviceId: string; rssi?: number; snr?: number; hops?: number }
+  | { kind: "node-discovered";    deviceId: string; rssi?: number; snr?: number; hops?: number; via?: string }
   // [STEP 4A] Relayed RSSI/SNR from a direct neighbor's HELLO beacon.
   | { kind: "neighbor-heard";     deviceId: string; rssi?: number; snr?: number }
   // [NEW] Another node sent us a ##PAIR_REQ## over LoRa.
@@ -285,6 +287,10 @@ export function useRangerConnection({
           // [v6] Pull signal readings from the frame to forward with the text.
           const rssi = frame.rssi as number | undefined;
           const snr  = frame.snr  as number | undefined;
+          // [STEP 19] Live mesh-routing status for this exact packet — see
+          // the "message" IncomingFrame doc in lib/protocol.ts.
+          const hops = frame.hops as number | undefined;
+          const via  = frame.via  as string | undefined;
 
           const decoded = decodeMessage({
             sender:    (frame.sender as string) ?? "unknown",
@@ -300,6 +306,8 @@ export function useRangerConnection({
               broadcast: decoded.broadcast,
               rssi,            // [v6] forward signal strength
               snr,             // [v6] forward signal-to-noise
+              hops,            // [STEP 19] forward live routing status
+              via,
             });
 
           } else if (decoded.kind === "location-request") {
@@ -319,6 +327,8 @@ export function useRangerConnection({
               // response events, not only on text messages.
               rssi,
               snr,
+              hops,            // [STEP 19]
+              via,
             });
 
           } else if (decoded.kind === "location-stop") {
@@ -399,6 +409,7 @@ export function useRangerConnection({
             rssi:     frame.rssi as number | undefined,
             snr:      frame.snr  as number | undefined,   // [v6] forward SNR
             hops:     frame.hops as number | undefined,    // [STEP 4A]
+            via:      frame.via  as string | undefined,    // [STEP 19]
             // [STEP 8] battery removed
           });
           break;

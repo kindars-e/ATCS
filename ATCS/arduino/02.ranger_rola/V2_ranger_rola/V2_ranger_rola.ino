@@ -144,8 +144,8 @@
 // be different on every physical node and MUST be 8 characters or
 // fewer (NODE_ID_LEN below) so it fits the fixed-size header field.
 // ════════════════════════════════════════════════════════════════════════
-#define THIS_DEVICE_ID  "Node1"          // ← Change per node (max 8 chars)
-#define WIFI_SSID       "ATCS-node 1"    // ← Must match THIS_DEVICE_ID suffix
+#define THIS_DEVICE_ID  "Node4"          // ← Change per node (max 8 chars)
+#define WIFI_SSID       "ATCS-node 4"    // ← Must match THIS_DEVICE_ID suffix
 #define WIFI_PASS       "atcs1234"
 
 // ════════════════════════════════════════════════════════════════════════
@@ -220,15 +220,21 @@
 // TOTAL budget across up to MAX_RREQ_ATTEMPTS tries, not a single attempt.
 // A lone lost RREQ broadcast on a lossy RF link no longer means an instant
 // "no route" failure — one controlled retry happens first.
-#define ROUTE_DISCOVERY_TIMEOUT_MS  6000   // total budget across all RREQ attempts
+#define ROUTE_DISCOVERY_TIMEOUT_MS  8000   // total budget across all RREQ attempts
 #define MAX_RREQ_ATTEMPTS              2     // 1 initial + 1 controlled retry (bounded — never loops)
 #define RREQ_RETRY_INTERVAL_MS      3000   // resend once if no RREP within this long
 // [STEP 7] Increased from 1500 → 3000 ms: a 3-hop ACK round-trip on a
 // loaded mesh with jitter can take 300-800 ms; 1500 ms was too tight and
-// caused premature retries that added congestion. 3 retries × 3 s = 9 s
-// before route-recovery kicks in (Step 4A), which is still timely.
-#define ACK_TIMEOUT_MS           3000   // how long to wait for an end-to-end ACK
-#define MAX_SEND_RETRIES            3     // unicast resend attempts before giving up
+// caused premature retries that added congestion.
+// [STEP 19] Increased again, 3000 → 5000 ms, and MAX_SEND_RETRIES 3 → 5:
+// a destination that's only *temporarily* out of range (walked behind
+// cover, briefly rebooted) commonly comes back within 10-20 seconds — the
+// old 3 × 3s = 9s budget routinely gave up and reported "delivery failed"
+// before that window closed. 5 retries × 5s = 25s of direct retries, plus
+// the route-recovery cycle below, gives a real offline-and-back-online
+// node enough time to be reached again instead of a premature failure.
+#define ACK_TIMEOUT_MS           5000   // how long to wait for an end-to-end ACK
+#define MAX_SEND_RETRIES            5     // unicast resend attempts before giving up
 #define SEEN_CACHE_EXPIRY_MS    30000   // forget old dedup entries
 
 // [STEP 4A FIX #2] Auto-clear scanning mode. The app's continuous scan
@@ -947,14 +953,24 @@ void wsBroadcast(String& json) {
   if (connectedClients > 0) webSocket.broadcastTXT(json);
 }
 
+// [STEP 19] hop/prevHop added so the app can show real, live mesh-routing
+// status (e.g. "Via Node2") on every message/location update, not just the
+// one-off DISCOVER_REPLY scan. hop is how many hops THIS packet actually
+// travelled to reach us; prevHop is the direct neighbor that physically
+// handed it to us on the last hop — the correct "via" node even when the
+// packet's ultimate original sender (`sender`) is further away than that.
+// prevHop == sender itself whenever hop == 0 (direct), so "via" is only
+// meaningful (and only sent) when hop > 0.
 void deliverMessageToPhone(const char* sender, const char* data, bool broadcast,
-                            int16_t rssi, float snr) {
+                            int16_t rssi, float snr, uint8_t hop, const char* prevHop) {
   doc.clear();
   doc["type"]   = "message";
   doc["sender"] = sender;
   doc["data"]   = data;
   doc["rssi"]   = rssi;
   doc["snr"]    = snr;
+  doc["hops"]   = hop;
+  if (hop > 0) doc["via"] = prevHop;
   if (broadcast) doc["broadcast"] = true;
   String out; serializeJson(doc, out);
   wsBroadcast(out);
@@ -1471,6 +1487,10 @@ void handleReceivedPacket(const uint8_t* buf, int len, int16_t rssi, float snr) 
         doc["rssi"]     = rssi;
         doc["snr"]      = snr;
         doc["hops"] = h.payloadLen > 0 ? payload[0] : h.hop;
+        // [STEP 19] Same "via" convention as deliverMessageToPhone: the
+        // direct neighbor that physically handed us THIS reply packet,
+        // only meaningful (and only sent) when it wasn't received directly.
+        if (h.hop > 0) doc["via"] = h.prevHop;
         // [STEP 8] battery removed from discovery reply
         String out; serializeJson(doc, out); wsBroadcast(out);
         if (connectedClients > 0 && !isScanning) setLedState(LED_NORMAL);
@@ -1496,7 +1516,7 @@ void handleReceivedPacket(const uint8_t* buf, int len, int16_t rssi, float snr) 
       text[h.payloadLen] = '\0';
 
       msgReceived++; lastMsgTime = millis();
-      deliverMessageToPhone(h.src, text, broadcast, rssi, snr);
+      deliverMessageToPhone(h.src, text, broadcast, rssi, snr, h.hop, h.prevHop);
 
       if (strstr(text, "SOS") != nullptr) triggerEmergencyBlink();
 

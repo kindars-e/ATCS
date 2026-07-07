@@ -77,7 +77,6 @@ export const SPLASH_DURATION_MS = 3_000;
 export const EMERGENCY_BROADCAST_ID = "*";
 
 // ── Local storage keys ────────────────────────────────────────────────────────
-export const TRAILS_STORAGE_KEY   = "fling-trails";
 export const CONTACTS_STORAGE_KEY  = "fling-contacts";
 // [STEP 9] Flat list of named waypoints (GPS coordinates + label) for the
 // redesigned navigation system. Separate key from trails to keep them simple.
@@ -151,7 +150,11 @@ export const LIVE_SHARE_CHECK_INTERVAL_MS = 2_000;
 
 // How long to wait for a location-request to be answered before giving up
 // and showing an error instead of spinning forever.
-export const LOCATION_REQUEST_TIMEOUT_MS = 20_000;
+// [STEP 19] Increased 20s → 30s, matching the firmware's more patient
+// ACK_TIMEOUT_MS/MAX_SEND_RETRIES budget — a destination that's only
+// temporarily out of range and comes back within the mesh's own retry
+// window should get an answer through, not a premature timeout here first.
+export const LOCATION_REQUEST_TIMEOUT_MS = 30_000;
 
 // A received location fix older than this is shown with a "stale" warning;
 // older than LOCATION_LOST_MS it's shown as "may no longer be accurate"
@@ -165,7 +168,7 @@ export const LOCATION_LOST_MS  = 120_000;
 export const SOS_LOCATION_DEBOUNCE_MS = 8_000;
 
 // [STEP 7] How long a message stays "sent" before the UI assumes the
-// firmware is retrying and shows a "Retrying…" state. Set just above
-// the firmware's new ACK_TIMEOUT_MS (3 s) so the visual flip happens
-// right after the first retry starts, not before.
-export const ACK_RETRY_VISUAL_DELAY_MS = 3_500;
+// firmware is retrying and shows a "Retrying…" state.
+// [STEP 19] Set just above the firmware's ACK_TIMEOUT_MS (now 5s, was 3s)
+// so the visual flip happens right after the first retry starts, not before.
+export const ACK_RETRY_VISUAL_DELAY_MS = 5_500;

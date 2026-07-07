@@ -57,18 +57,16 @@ interface CompassModalProps {
    * it must never fully end the session, only minimise it.
    */
   onMinimize?: () => void;
-  /** [STEP 12] Switch to the map view for this same contact/waypoint —
-      reuses the existing navigation architecture instead of a separate
-      location UI, per the map being the primary visualization throughout.
-      This is the dedicated Map button — a separate action from X/minimize,
-      with its own way back to Compass (the map's own Compass toggle). */
-  onViewMap?: () => void;
   /** [STEP 14] Real device id to target when Beep is tapped, for a
       waypoint-sourced navigation that still represents an actual node (an
       SOS location) rather than a manually placed pin (camp/water/etc, which
       has nothing to beep). Falls back to the contact's own id for real
       (non-waypoint) contacts. */
   beepDeviceId?: string;
+  /** [STEP 19] Display name for contact.signalViaNodeId, resolved by the
+      caller (which has the full contacts list) — this component only ever
+      sees the one contact being navigated to. */
+  viaNodeName?: string;
 }
 
 function formatAge(ms: number): string {
@@ -92,7 +90,13 @@ function angularDiff(a: number, b: number): number {
 // Distance: medium alpha, but we skip updates < 1m for UI stability.
 const GPS_BEARING_ALPHA = 0.30;  // smoothes GPS-derived bearing to target
 const NEEDLE_ALPHA      = 0.40;  // smoothes the final needle angle
-const DISTANCE_ALPHA    = 0.30;  // smoothes raw distance calculation
+// [STEP 20] Raised 0.30 → 0.55. userPosition here is already smoothed once,
+// adaptively, by use-geolocation.ts's own accuracy-based EMA — this second
+// pass was stacking on top of that, and at 0.30 the combined lag while
+// actually walking (not standing still) could trail the true distance by
+// several metres, which read as "inaccurate" even with good GPS. This still
+// damps sample-to-sample jitter, just converges roughly twice as fast.
+const DISTANCE_ALPHA    = 0.55;  // smoothes raw distance calculation
 // [STEP 12] The displayed "±X m" accuracy figures previously showed the RAW
 // instantaneous accuracy every render — even after Step 11 fixed the
 // fabricated-5000m bug, real GPS accuracy still bounces sample to sample,
@@ -119,8 +123,8 @@ export function CompassModal({
   onBeep,
   onClose,
   onMinimize,
-  onViewMap,
   beepDeviceId,
+  viaNodeName,
 }: CompassModalProps) {
   const {
     position: userPosition,
@@ -362,22 +366,6 @@ export function CompassModal({
         </p>
       </button>
 
-      {/* [STEP 12] View on Map — reuses the existing map/navigation
-          architecture instead of a separate location UI. */}
-      {onViewMap ? (
-        <button onClick={onViewMap} className="group relative">
-          <div className="absolute inset-0 bg-blue-500 rounded-full opacity-0 group-hover:opacity-20 transition-opacity duration-200" />
-          <div className="relative bg-gray-800/80 backdrop-blur-sm p-4 rounded-full border border-gray-700 transition-all group-hover:border-blue-500/50 group-active:scale-95">
-            <MapPin className="w-6 h-6 text-gray-300 group-hover:text-blue-400 transition-colors" />
-          </div>
-          <p className="text-xs text-gray-500 text-center mt-2 opacity-0 group-hover:opacity-100 transition-opacity">
-            Map
-          </p>
-        </button>
-      ) : (
-        <div className="w-16" />
-      )}
-
       {beepTargetId ? (
         <button onClick={handleBeep} className={`group relative transition-all ${isBeeping ? "animate-pulse" : ""}`}>
           <div className={`absolute inset-0 rounded-full transition-all duration-300 ${
@@ -474,6 +462,18 @@ export function CompassModal({
         <div className="w-full text-center mt-4">
           <p className="text-sm uppercase opacity-75">Finding</p>
           <h1 className="text-3xl font-bold mt-1">{contact.deviceName}</h1>
+          {/* [STEP 19] Same live mesh-routing status as phone-compass mode. */}
+          {!isWaypoint && (
+            <p className="text-xs text-gray-500 mt-0.5">
+              {contact.reachability === "stale"
+                ? "Not seen recently over the mesh"
+                : contact.signalHopDistance === undefined
+                ? "Route not yet known"
+                : contact.signalHopDistance === 0
+                ? "Direct connection"
+                : `Via ${viaNodeName ?? "relay"}${contact.signalHopDistance > 1 ? ` · ${contact.signalHopDistance} hops` : ""}`}
+            </p>
+          )}
           <div className="mt-2 inline-flex items-center gap-1.5 bg-blue-900/40 border border-blue-700/50 rounded-full px-3 py-1 text-xs text-blue-300">
             <MapPin className="w-3 h-3" />
             {usingFallback ? "City-level location (IP)" : "GPS location"}
@@ -578,15 +578,21 @@ export function CompassModal({
       <div className="w-full text-center mt-4">
         <p className="text-sm uppercase opacity-75">Finding</p>
         <h1 className="text-3xl font-bold mt-1">{contact.deviceName}</h1>
-        {/* [STEP 12] Mesh path indication (item 8) — how many hops away this
-            contact currently is, at the level of detail the firmware
-            actually tracks (hop count; the literal relay chain isn't
-            recorded on the wire without a protocol change). */}
-        {!isWaypoint && contact.signalHopDistance !== undefined && (
+        {/* [STEP 19] Live mesh-routing status. "Direct connection" only when
+            the last message/location actually arrived with 0 hops; a real
+            relay shows the actual node that handed it to us (e.g. "Via
+            Node2"), not just a hop count. A contact the mesh hasn't heard
+            from recently says so explicitly instead of silently keeping
+            whatever route status was last known. */}
+        {!isWaypoint && (
           <p className="text-xs text-gray-500 mt-0.5">
-            {contact.signalHopDistance === 0
+            {contact.reachability === "stale"
+              ? "Not seen recently over the mesh"
+              : contact.signalHopDistance === undefined
+              ? "Route not yet known"
+              : contact.signalHopDistance === 0
               ? "Direct connection"
-              : `Via mesh relay — ${contact.signalHopDistance} hop${contact.signalHopDistance > 1 ? "s" : ""} away`}
+              : `Via ${viaNodeName ?? "relay"}${contact.signalHopDistance > 1 ? ` · ${contact.signalHopDistance} hops` : ""}`}
           </p>
         )}
         {usingFallback && (

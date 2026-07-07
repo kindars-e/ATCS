@@ -88,7 +88,12 @@ export type OutgoingFrame =
 // dead code and has been removed too.
 export type IncomingFrame =
   // [NEW] broadcast?: true when this message arrived as a LoRa "*" broadcast.
-  | { type: "message";     sender: string; data: string; rssi?: number; broadcast?: boolean }
+  // [STEP 19] hops: how many mesh hops this packet actually travelled to
+  // reach us. via: the direct neighbor that physically relayed it on the
+  // last hop — present only when hops > 0 (a direct/0-hop packet has
+  // nothing to name). Lets the app show live "Via <node>" routing status
+  // on every message, not just a one-off discovery scan.
+  | { type: "message";     sender: string; data: string; rssi?: number; broadcast?: boolean; hops?: number; via?: string }
   // [STEP 8] battery removed from all incoming frames
   | { type: "device_info"; deviceId: string; deviceName: string; frequency?: number;
                            spreadingFactor?: number; bandwidth?: number }
@@ -97,7 +102,7 @@ export type IncomingFrame =
                            pktDroppedDup: number; pktDroppedNoRoute: number;
                            pktDroppedQueueFull: number; routeDiscoveries: number }
   | { type: "delivery";    status: "delivered" | "failed" | "sos_received"; dest?: string; from?: string }
-  | { type: "discovery";   deviceId: string; rssi?: number; hops?: number }
+  | { type: "discovery";   deviceId: string; rssi?: number; hops?: number; via?: string }
   | { type: "neighbor";    deviceId: string; rssi?: number; snr?: number };
 
 // ── Decoded message types ─────────────────────────────────────────────────────

@@ -30,7 +30,6 @@ interface PwaInstallHandle {
 
 interface ContactsViewProps {
   contacts: Contact[];
-  activeTrailCount: number;
   pwaInstall: PwaInstallHandle;
   connectionState: ConnectionState;
   reconnectAttempts: number;
@@ -47,7 +46,6 @@ interface ContactsViewProps {
 
 export function ContactsView({
   contacts,
-  activeTrailCount,
   pwaInstall,
   connectionState,
   reconnectAttempts,
@@ -96,11 +94,6 @@ export function ContactsView({
                 className="relative p-3 rounded-xl hover:bg-gray-800 transition-colors group"
               >
                 <Navigation className="h-5 w-5 text-gray-400 group-hover:text-white transition-colors" />
-                {activeTrailCount > 0 && (
-                  <div className="absolute top-2 right-2">
-                    <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
-                  </div>
-                )}
               </button>
               {/* [REMOVED] Settings button — it had no onClick handler and did
                   nothing, which confused users. Removed for now; can be

@@ -24,6 +24,11 @@ export type Contact = {
   signalQuality?: SignalQuality;
   signalSampledAt?: Date;     // when rssi/snr was actually measured
   signalHopDistance?: number; // 0 = direct neighbor (HELLO-relay), >0 = relayed/multi-hop
+  // [STEP 19] The direct neighbor's device id that physically relayed the
+  // most recent message/location from this contact — undefined when
+  // signalHopDistance is 0 (direct) or simply not yet known. Resolved to a
+  // display name via the contacts list at render time, not stored here.
+  signalViaNodeId?: string;
   location?: ContactLocation;
   // [STEP 8] battery removed — no hardware to read it from.
 };
@@ -102,29 +107,6 @@ export type ConnectionState =
   | "connected"
   | "error"
   | "reconnecting";
-
-export type Waypoint = {
-  id: string;
-  name: string;
-  location: {
-    lat: number;
-    lng: number;
-    accuracy: number;
-  };
-  timestamp: Date;
-  type: "start" | "waypoint" | "camp" | "danger" | "water" | "interest";
-  notes?: string;
-};
-
-export type Trail = {
-  id: string;
-  name: string;
-  waypoints: Waypoint[];
-  startTime: Date;
-  endTime?: Date;
-  totalDistance: number;
-  active: boolean;
-};
 
 // Not in lib.dom.d.ts — Chromium-only PWA install event.
 export interface BeforeInstallPromptEvent extends Event {

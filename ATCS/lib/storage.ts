@@ -5,42 +5,8 @@
 // writes the same keys.  The data survives page reloads.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { CONTACTS_STORAGE_KEY, MESSAGES_STORAGE_KEY, TRAILS_STORAGE_KEY, WAYPOINTS_STORAGE_KEY } from "./constants";
+import { CONTACTS_STORAGE_KEY, MESSAGES_STORAGE_KEY, WAYPOINTS_STORAGE_KEY } from "./constants";
 import type { Contact, Message } from "./types";
-import type { Trail } from "./types";
-
-// ── Trail persistence (unchanged from original Fling) ────────────────────────
-
-// [STEP 6] Revive Dates the same way readContacts()/readMessages() already
-// do — JSON has no Date type, so timestamps come back as strings unless we
-// convert them. This used to be done ad hoc, inline, inside
-// components/waypoint-modal.tsx (with `endTime: null` instead of `undefined`
-// for absent values, a type mismatch); centralizing it here means every
-// caller gets the same correct behavior instead of duplicating it.
-export function readTrails(): Trail[] {
-  if (typeof window === "undefined") return [];
-  const raw = window.localStorage.getItem(TRAILS_STORAGE_KEY);
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw) as Trail[];
-    return parsed.map((trail) => ({
-      ...trail,
-      startTime: new Date(trail.startTime),
-      endTime:   trail.endTime ? new Date(trail.endTime) : undefined,
-      waypoints: trail.waypoints.map((wp) => ({
-        ...wp,
-        timestamp: new Date(wp.timestamp),
-      })),
-    }));
-  } catch {
-    return [];
-  }
-}
-
-export function writeTrails(trails: Trail[]): void {
-  if (typeof window === "undefined") return;
-  window.localStorage.setItem(TRAILS_STORAGE_KEY, JSON.stringify(trails));
-}
 
 // ── Contact persistence (NEW) ─────────────────────────────────────────────────
 // Contacts are saved so they survive a page reload.
