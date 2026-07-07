@@ -144,8 +144,8 @@
 // be different on every physical node and MUST be 8 characters or
 // fewer (NODE_ID_LEN below) so it fits the fixed-size header field.
 // ════════════════════════════════════════════════════════════════════════
-#define THIS_DEVICE_ID  "Node3"          // ← Change per node (max 8 chars)
-#define WIFI_SSID       "ATCS-node 3"    // ← Must match THIS_DEVICE_ID suffix
+#define THIS_DEVICE_ID  "Node1"          // ← Change per node (max 8 chars)
+#define WIFI_SSID       "ATCS-node 1"    // ← Must match THIS_DEVICE_ID suffix
 #define WIFI_PASS       "atcs1234"
 
 // ════════════════════════════════════════════════════════════════════════

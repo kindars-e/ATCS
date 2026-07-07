@@ -15,23 +15,18 @@
 // WHERE THE TILES COME FROM
 // ──────────────────────────
 // A pre-rendered package (built by the team, offline, ahead of a
-// deployment — see scripts/generate-tile-package.mjs) committed straight
-// into this repo under tile-packages/<name>/, served to the app via GitHub's
-// raw-content CDN. Not a live OpenStreetMap tile server — the app only ever
-// talks to infrastructure the team controls, so this can never reproduce the
-// tile-usage-policy incident hit before.
-//
-// WHY NOT A ZIP
-// ─────────────
-// Each tile is its own tiny file already (a few KB). Fetching them
-// individually — instead of one big zip that then needs unzipping on-device
-// — needs no extra dependency (no unzip library) and is naturally resumable:
-// if the app is killed or loses connectivity mid-download, whatever's
-// already on disk is skipped next time, and the rest just continues.
+// deployment — see scripts/generate-tile-package.mjs), zipped and uploaded
+// as a GitHub Release asset on this repo — never a live OpenStreetMap tile
+// server, so this can't reproduce the tile-usage-policy incident hit
+// before. Release assets are served through GitHub's object-storage CDN
+// (a different pipeline than raw.githubusercontent.com), which is why a
+// single zip archive is used here rather than fetching thousands of
+// individual tile files directly out of the repo.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { Filesystem, Directory, Encoding } from "@capacitor/filesystem";
 import { Capacitor } from "@capacitor/core";
+import { unzip } from "fflate";
 
 export interface OfflineTileManifest {
   minZoom: number;
@@ -52,68 +47,33 @@ const TILES_DIR = "offline-tiles";
 const MANIFEST_PATH = `${TILES_DIR}/manifest.json`;
 const COMPLETE_MARKER_PATH = `${TILES_DIR}/.complete`;
 
-// Regenerate the source package with scripts/generate-tile-package.mjs, then
-// commit tile-packages/<name>/ to this repo and update the path below.
-const REMOTE_BASE = "https://raw.githubusercontent.com/kindars-e/ATCS/main/tile-packages/dodoma-v1";
+// Regenerate the source package with scripts/generate-tile-package.mjs, zip
+// the output folder, and attach it to a GitHub Release on this repo — see
+// tile-packages/README.md for the exact steps. Update this to match.
+const PACKAGE_URL = "https://github.com/kindars-e/ATCS/releases/download/tiles-dodoma-v1/dodoma-v1.zip";
 
-// A partial download only counts as "done" if at least this fraction of
-// tiles actually succeeded — otherwise a future launch with better
-// connectivity retries the missing ones instead of silently accepting a
-// mostly-empty package forever.
+// A partial extraction only counts as "done" if at least this fraction of
+// the archive's files actually got written to disk — otherwise a future
+// launch with better connectivity/storage retries instead of silently
+// accepting a mostly-empty package forever.
 const MIN_SUCCESS_RATIO_TO_COMPLETE = 0.9;
 
-const DOWNLOAD_CONCURRENCY = 6;
-
-function lon2tileX(lon: number, z: number): number {
-  return Math.floor(((lon + 180) / 360) * 2 ** z);
-}
-function lat2tileY(lat: number, z: number): number {
-  const rad = (lat * Math.PI) / 180;
-  return Math.floor(
-    ((1 - Math.log(Math.tan(rad) + 1 / Math.cos(rad)) / Math.PI) / 2) * 2 ** z,
-  );
+function unzipAsync(data: Uint8Array): Promise<Record<string, Uint8Array>> {
+  return new Promise((resolve, reject) => {
+    unzip(data, (err, unzipped) => {
+      if (err) reject(err);
+      else resolve(unzipped);
+    });
+  });
 }
 
-function enumerateTiles(manifest: OfflineTileManifest): Array<{ z: number; x: number; y: number }> {
-  const [south, west, north, east] = manifest.bounds;
-  const jobs: Array<{ z: number; x: number; y: number }> = [];
-  for (let z = manifest.minZoom; z <= manifest.maxZoom; z++) {
-    const xMin = lon2tileX(west, z);
-    const xMax = lon2tileX(east, z);
-    const yMin = lat2tileY(north, z);
-    const yMax = lat2tileY(south, z);
-    for (let x = xMin; x <= xMax; x++) {
-      for (let y = yMin; y <= yMax; y++) {
-        jobs.push({ z, x, y });
-      }
-    }
-  }
-  return jobs;
-}
-
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
+function arrayBufferToBase64(buffer: Uint8Array): string {
   let binary = "";
-  const bytes = new Uint8Array(buffer);
   const chunkSize = 0x8000; // avoid stack overflow on String.fromCharCode spread
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  for (let i = 0; i < buffer.length; i += chunkSize) {
+    binary += String.fromCharCode(...buffer.subarray(i, i + chunkSize));
   }
   return btoa(binary);
-}
-
-async function runWithConcurrency<T>(
-  items: T[],
-  limit: number,
-  worker: (item: T) => Promise<void>,
-): Promise<void> {
-  let cursor = 0;
-  async function next(): Promise<void> {
-    const i = cursor++;
-    if (i >= items.length) return;
-    await worker(items[i]);
-    return next();
-  }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => next()));
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -151,66 +111,58 @@ export async function getDownloadedTileUrlTemplate(): Promise<string | null> {
   return `${converted}/{z}/{x}/{y}.png`;
 }
 
-/** Fetches the remote manifest to plan a download without committing to it —
-    lets the caller show "~42 MB, continue?" before starting, if desired. */
-export async function fetchRemoteManifest(): Promise<OfflineTileManifest | null> {
-  try {
-    const res = await fetch(`${REMOTE_BASE}/manifest.json`);
-    if (!res.ok) return null;
-    return (await res.json()) as OfflineTileManifest;
-  } catch {
-    return null;
-  }
-}
-
-/** Downloads every tile in the remote package to local app storage, skipping
-    any already present (resumable across interrupted attempts). Returns true
-    only if enough tiles succeeded to mark the package usable. */
+/** Downloads the packaged zip, extracts every file to local app storage,
+    and marks the package usable once enough of it has been written. Safe to
+    call repeatedly — re-checks disk state internally, so a caller doesn't
+    need to track whether a previous attempt partially completed. */
 export async function downloadTilePackage(
   onProgress?: (progress: DownloadProgress) => void,
 ): Promise<boolean> {
   if (!Capacitor.isNativePlatform()) return false;
 
-  const manifest = await fetchRemoteManifest();
-  if (!manifest) return false;
+  let zipBytes: Uint8Array;
+  try {
+    const res = await fetch(PACKAGE_URL);
+    if (!res.ok) return false;
+    zipBytes = new Uint8Array(await res.arrayBuffer());
+  } catch {
+    return false;
+  }
 
-  const jobs = enumerateTiles(manifest);
-  const total = jobs.length;
-  let fetched = 0;
+  let entries: Record<string, Uint8Array>;
+  try {
+    entries = await unzipAsync(zipBytes);
+  } catch {
+    return false;
+  }
+
+  // Zip archives made on Windows can store `\`-separated paths — normalise
+  // to `/` so they work as Filesystem paths. Skip directory placeholder
+  // entries (empty content, path ends with a separator).
+  const files = Object.entries(entries)
+    .map(([rawPath, data]) => ({ path: rawPath.replace(/\\/g, "/"), data }))
+    .filter(({ path }) => !path.endsWith("/"));
+
+  const total = files.length;
+  let written = 0;
   let succeeded = 0;
 
-  await runWithConcurrency(jobs, DOWNLOAD_CONCURRENCY, async ({ z, x, y }) => {
-    const relPath = `${TILES_DIR}/${z}/${x}/${y}.png`;
-    if (await pathExists(relPath)) {
+  for (const { path, data } of files) {
+    try {
+      await Filesystem.writeFile({
+        path: `${TILES_DIR}/${path}`,
+        data: path.endsWith(".json") ? new TextDecoder().decode(data) : arrayBufferToBase64(data),
+        directory: Directory.Data,
+        encoding: path.endsWith(".json") ? Encoding.UTF8 : undefined,
+        recursive: true,
+      });
       succeeded++;
-    } else {
-      try {
-        const res = await fetch(`${REMOTE_BASE}/${z}/${x}/${y}.png`);
-        if (res.ok) {
-          const buf = await res.arrayBuffer();
-          await Filesystem.writeFile({
-            path: relPath,
-            data: arrayBufferToBase64(buf),
-            directory: Directory.Data,
-            recursive: true,
-          });
-          succeeded++;
-        }
-      } catch {
-        // Network hiccup or missing edge tile — skip, not fatal.
-      }
+    } catch {
+      // Disk-write hiccup on an individual file — skip, not fatal.
     }
-    fetched++;
-    onProgress?.({ fetched, total });
-  });
-
-  await Filesystem.writeFile({
-    path: MANIFEST_PATH,
-    data: JSON.stringify(manifest),
-    directory: Directory.Data,
-    encoding: Encoding.UTF8,
-    recursive: true,
-  });
+    written++;
+    onProgress?.({ fetched: written, total });
+  }
 
   const complete = total > 0 && succeeded / total >= MIN_SUCCESS_RATIO_TO_COMPLETE;
   if (complete) {
