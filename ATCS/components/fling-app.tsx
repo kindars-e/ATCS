@@ -1617,84 +1617,144 @@ export default function FlingApp() {
   // ════════════════════════════════════════════════════════════════════════
   return (
     <>
-      {/* [STEP 12] SOS mesh-confidence banner (item 9) — the mesh's flagship
-          "help is being coordinated" reassurance. Deliberately persistent
-          (no auto-dismiss timer, unlike the notices below) since this is the
-          most important context a user can have during an actual emergency.
-          Fully interactive (pointer-events-auto throughout, not just a tap
-          zone) — it's a small panel, not a passing toast. */}
-      {sosStatus && !showSplash && isWiFiConnected && (
-        <div className="fixed top-0 left-0 right-0 z-50 flex justify-center pt-14 px-4">
-          <div className="bg-red-950/95 border border-red-700 text-white text-sm px-4 py-3 rounded-xl shadow-lg shadow-red-900/50 flex flex-col gap-2 max-w-sm w-full animate-[fade-in_0.25s_ease-out]">
-            <div className="flex items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
-                <span className="h-2.5 w-2.5 rounded-full bg-red-400 animate-pulse" />
-                <span className="font-semibold">SOS Active</span>
+      {/* ── Top toast/banner stack ───────────────────────────────────────────
+          All top-anchored overlays (SOS status, the transient notices below,
+          and the minimized-navigation resume pill further down this file)
+          used to each be independently `fixed` with hand-guessed pixel
+          marginTops to stack under one another. That broke in two ways: (1)
+          any banner whose text wrapped to an extra line (e.g. the SOS
+          confirmation sentence on a narrow phone) silently overlapped the
+          next one instead of pushing it down, and (2) the resume pill lived
+          in its own fixed container at the exact same top offset as this
+          stack, so an active SOS banner fully hid it — the two most
+          emergency-relevant pieces of UI in the app could occlude each
+          other. One flex column fixes both: real layout does the stacking,
+          so it always matches actual rendered height, and every banner that
+          can appear here (including the resume pill) is a sibling instead
+          of a same-position rival. The container is pointer-events-none so
+          gaps between banners never block taps on the screen underneath;
+          each banner re-enables pointer-events on itself when interactive. */}
+      {!showSplash && isWiFiConnected && (
+        <div className="fixed top-0 left-0 right-0 z-50 flex flex-col items-center gap-2 pt-14 px-4 pointer-events-none">
+          {/* [STEP 12] SOS mesh-confidence banner (item 9) — the mesh's flagship
+              "help is being coordinated" reassurance. Deliberately persistent
+              (no auto-dismiss timer, unlike the notices below) since this is the
+              most important context a user can have during an actual emergency. */}
+          {sosStatus && (
+            <div className="pointer-events-auto bg-red-950/95 border border-red-700 text-white text-sm px-4 py-3 rounded-xl shadow-lg shadow-red-900/50 flex flex-col gap-2 max-w-sm w-full animate-[fade-in_0.25s_ease-out]">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="h-2.5 w-2.5 rounded-full bg-red-400 animate-pulse" />
+                  <span className="font-semibold">SOS Active</span>
+                </div>
+                <button
+                  onClick={() => setSosStatus(null)}
+                  className="text-red-300 hover:text-white transition-colors"
+                >
+                  <X className="h-4 w-4" />
+                </button>
               </div>
+              <p className="text-red-100">
+                {sosStatus.confirmedBy.length === 0
+                  ? "Propagating through the mesh — waiting for confirmation…"
+                  : `${sosStatus.confirmedBy.length} node${sosStatus.confirmedBy.length > 1 ? "s" : ""} confirmed receipt — help is reachable.`}
+              </p>
+            </div>
+          )}
+
+          {/* [v6 RANGE DETECTION] Transient notification banner. Slides in at the top
+              when a node changes reachability (out of range / weak / back online) and
+              auto-dismisses after a few seconds. Non-interactive so it never blocks
+              taps underneath. */}
+          {rangeNotice && (
+            <div className="bg-gray-900/95 border border-gray-700 text-white text-sm px-4 py-2.5 rounded-xl shadow-lg flex items-center justify-center gap-2 max-w-sm w-full animate-[fade-in_0.25s_ease-out]">
+              <span className="h-2 w-2 rounded-full bg-orange-400 animate-pulse" />
+              {rangeNotice}
+            </div>
+          )}
+
+          {/* [STEP 4B] Delivery-failed banner — stacks below the range notice
+              (rare to see both at once) rather than sharing its state, so an
+              unrelated reachability change can never silently swallow this. */}
+          {deliveryNotice && (
+            <div className="bg-gray-900/95 border border-red-800 text-white text-sm px-4 py-2.5 rounded-xl shadow-lg flex items-center justify-center gap-2 max-w-sm w-full animate-[fade-in_0.25s_ease-out]">
+              <span className="h-2 w-2 rounded-full bg-red-500" />
+              {deliveryNotice}
+            </div>
+          )}
+
+          {/* [STEP 6] Location-session banner (e.g. "X stopped sharing their
+              location") — stacks below the other two banners. */}
+          {locationNotice && (
+            <div
+              // pointer-events-auto re-enables taps on just this banner (the
+              // stack container is pointer-events-none) — only meaningful
+              // when an SOS location notice armed a tap action above.
+              onClick={() => {
+                if (!locationNoticeActionRef.current) return;
+                locationNoticeActionRef.current();
+                locationNoticeActionRef.current = null;
+                setLocationNotice(null);
+              }}
+              className={`pointer-events-auto bg-gray-900/95 border border-blue-800 text-white text-sm px-4 py-2.5 rounded-xl shadow-lg flex items-center justify-center gap-2 max-w-sm w-full animate-[fade-in_0.25s_ease-out] ${
+                locationNoticeActionRef.current ? "cursor-pointer hover:bg-gray-800/95" : ""
+              }`}
+            >
+              <span className="h-2 w-2 rounded-full bg-blue-400" />
+              {locationNotice}
+            </div>
+          )}
+
+          {/* [Step 9 — Issue 3] Live-sharing pill. Previously its own fixed
+              element at this same top offset (identical bug class to the
+              resume pill below) — folded into this stack so it can't overlap
+              the resume pill or any notice above it. */}
+          {liveSharingActive && (
+            <div className="pointer-events-auto bg-emerald-900/95 border border-emerald-700 rounded-2xl px-4 py-2.5 flex items-center gap-3 shadow-xl max-w-xs w-full">
+              <span className="h-2.5 w-2.5 rounded-full bg-emerald-400 animate-pulse flex-shrink-0" />
+              <div className="min-w-0 flex-1">
+                <p className="text-sm font-semibold text-white truncate">Sharing live location</p>
+                {locationDebugMessage && (
+                  <p className="text-xs text-emerald-300 truncate">{locationDebugMessage}</p>
+                )}
+              </div>
+              <Button
+                onClick={stopLiveShare}
+                size="sm"
+                className="bg-red-600 hover:bg-red-700 text-white rounded-xl px-3 flex-shrink-0 text-xs"
+              >
+                Stop
+              </Button>
+            </div>
+          )}
+
+          {/* [STEP 16] Navigation resume pill — shown when a nav session is
+              active but the compass has been minimised (X pressed). Tapping
+              the text reopens the compass; the small X ends the session
+              completely. Lives in this same stack (previously its own fixed
+              element at an identical top offset) so it can never end up
+              invisibly hidden directly behind another banner. */}
+          {activeNavContact && !showCompass && (
+            <div className="pointer-events-auto bg-blue-900/95 border border-blue-700 rounded-2xl px-4 py-2.5 flex items-center gap-3 shadow-xl max-w-xs w-full">
+              <span className="h-2.5 w-2.5 rounded-full bg-blue-400 animate-pulse flex-shrink-0" />
               <button
-                onClick={() => setSosStatus(null)}
-                className="text-red-300 hover:text-white transition-colors"
+                onClick={() => setShowCompass(true)}
+                className="text-sm font-semibold text-white truncate flex-1 text-left"
+              >
+                Navigate → {activeNavContact.deviceName}
+              </button>
+              <button
+                onClick={() => {
+                  setActiveNavContact(null);
+                  setActiveNavBeepDeviceId(undefined);
+                  resetAllLocationState();
+                }}
+                className="p-1 text-blue-400 hover:text-white flex-shrink-0"
               >
                 <X className="h-4 w-4" />
               </button>
             </div>
-            <p className="text-red-100">
-              {sosStatus.confirmedBy.length === 0
-                ? "Propagating through the mesh — waiting for confirmation…"
-                : `${sosStatus.confirmedBy.length} node${sosStatus.confirmedBy.length > 1 ? "s" : ""} confirmed receipt — help is reachable.`}
-            </p>
-          </div>
-        </div>
-      )}
-
-      {/* [v6 RANGE DETECTION] Transient notification banner. Slides in at the top
-          when a node changes reachability (out of range / weak / back online) and
-          auto-dismisses after a few seconds. pointer-events-none so it never
-          blocks taps underneath. Hidden during splash/Wi-Fi setup. */}
-      {rangeNotice && !showSplash && isWiFiConnected && (
-        <div className="fixed top-0 left-0 right-0 z-50 flex justify-center pt-14 px-4 pointer-events-none">
-          <div className="bg-gray-900/95 border border-gray-700 text-white text-sm px-4 py-2.5 rounded-xl shadow-lg flex items-center gap-2 animate-[fade-in_0.25s_ease-out]" style={{ marginTop: sosStatus ? 96 : 0 }}>
-            <span className="h-2 w-2 rounded-full bg-orange-400 animate-pulse" />
-            {rangeNotice}
-          </div>
-        </div>
-      )}
-
-      {/* [STEP 4B] Delivery-failed banner — stacks below the range notice
-          (rare to see both at once) rather than sharing its state, so an
-          unrelated reachability change can never silently swallow this. */}
-      {deliveryNotice && !showSplash && isWiFiConnected && (
-        <div className="fixed top-0 left-0 right-0 z-50 flex justify-center pt-14 px-4 pointer-events-none">
-          <div className="bg-gray-900/95 border border-red-800 text-white text-sm px-4 py-2.5 rounded-xl shadow-lg flex items-center gap-2 animate-[fade-in_0.25s_ease-out]" style={{ marginTop: (sosStatus ? 96 : 0) + (rangeNotice ? 48 : 0) }}>
-            <span className="h-2 w-2 rounded-full bg-red-500" />
-            {deliveryNotice}
-          </div>
-        </div>
-      )}
-
-      {/* [STEP 6] Location-session banner (e.g. "X stopped sharing their
-          location") — stacks below the other two banners. */}
-      {locationNotice && !showSplash && isWiFiConnected && (
-        <div className="fixed top-0 left-0 right-0 z-50 flex justify-center pt-14 px-4 pointer-events-none">
-          <div
-            // [STEP 12] pointer-events-auto re-enables taps on just this
-            // banner (its container is pointer-events-none so it never
-            // blocks the screen underneath) — only meaningful when an SOS
-            // location notice armed a tap action above.
-            onClick={() => {
-              if (!locationNoticeActionRef.current) return;
-              locationNoticeActionRef.current();
-              locationNoticeActionRef.current = null;
-              setLocationNotice(null);
-            }}
-            className={`bg-gray-900/95 border border-blue-800 text-white text-sm px-4 py-2.5 rounded-xl shadow-lg flex items-center gap-2 animate-[fade-in_0.25s_ease-out] pointer-events-auto ${
-              locationNoticeActionRef.current ? "cursor-pointer hover:bg-gray-800/95" : ""
-            }`}
-            style={{ marginTop: (sosStatus ? 96 : 0) + (rangeNotice ? 48 : 0) + (deliveryNotice ? 48 : 0) }}
-          >
-            <span className="h-2 w-2 rounded-full bg-blue-400" />
-            {locationNotice}
-          </div>
+          )}
         </div>
       )}
 
@@ -1849,32 +1909,6 @@ export default function FlingApp() {
         </div>
       )}
 
-      {/* [Step 9 — Issue 3] Live-sharing pill — repositioned from bottom-0
-          (which covered the chat input) to a slim floating strip just below
-          the header/status bar area (top-14 ≈ 56px). This is consistent with
-          how modern navigation apps surface persistent session indicators
-          without blocking any interactive content. */}
-      {liveSharingActive && (
-        <div className="fixed top-14 left-0 right-0 z-40 flex justify-center px-4 pointer-events-auto">
-          <div className="bg-emerald-900/95 border border-emerald-700 rounded-2xl px-4 py-2.5
-                          flex items-center gap-3 shadow-xl max-w-xs w-full">
-            <span className="h-2.5 w-2.5 rounded-full bg-emerald-400 animate-pulse flex-shrink-0" />
-            <div className="min-w-0 flex-1">
-              <p className="text-sm font-semibold text-white truncate">Sharing live location</p>
-              {locationDebugMessage && (
-                <p className="text-xs text-emerald-300 truncate">{locationDebugMessage}</p>
-              )}
-            </div>
-            <Button
-              onClick={stopLiveShare}
-              size="sm"
-              className="bg-red-600 hover:bg-red-700 text-white rounded-xl px-3 flex-shrink-0 text-xs"
-            >
-              Stop
-            </Button>
-          </div>
-        </div>
-      )}
 
       {/* ── Incoming location permission request (consent only, dismissed on accept) ── */}
       {showLocationPermission && incomingLocationRequest && (
@@ -1914,34 +1948,6 @@ export default function FlingApp() {
                 </div>
               </>
             </div>
-          </div>
-        </div>
-      )}
-
-      {/* [STEP 16] Navigation resume pill — shown when a nav session is
-          active but the compass has been minimised (X pressed). Tapping the
-          text reopens the compass; the small X ends the session completely. */}
-      {activeNavContact && !showCompass && (
-        <div className="fixed top-14 left-0 right-0 z-40 flex justify-center px-4 pointer-events-auto">
-          <div className="bg-blue-900/95 border border-blue-700 rounded-2xl px-4 py-2.5
-                          flex items-center gap-3 shadow-xl max-w-xs w-full">
-            <span className="h-2.5 w-2.5 rounded-full bg-blue-400 animate-pulse flex-shrink-0" />
-            <button
-              onClick={() => setShowCompass(true)}
-              className="text-sm font-semibold text-white truncate flex-1 text-left"
-            >
-              Navigate → {activeNavContact.deviceName}
-            </button>
-            <button
-              onClick={() => {
-                setActiveNavContact(null);
-                setActiveNavBeepDeviceId(undefined);
-                resetAllLocationState();
-              }}
-              className="p-1 text-blue-400 hover:text-white flex-shrink-0"
-            >
-              <X className="h-4 w-4" />
-            </button>
           </div>
         </div>
       )}

@@ -29,7 +29,7 @@
 //   updates instantly and the change is saved automatically.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { useEffect, useState, type RefObject } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -116,6 +116,36 @@ export function ChatView({
     setLongPressMessageId(null);
   }, [contact.deviceId]);
 
+  // ── [UI/UX REVIEW] Measured header/footer heights ──────────────────────────
+  // The header and input bar are `fixed`, so the scrollable message list needs
+  // matching top/bottom padding to avoid messages sliding underneath them.
+  // That padding used to be two hardcoded constants (100px / 90px) that only
+  // matched the base case — the header grows when the emergency banner or the
+  // connection-status row appears, and the footer grows when the "will send
+  // once reconnected" offline banner appears, so those extra rows could
+  // overlap the first/last message instead of pushing the padding out to
+  // match. Measuring the real rendered height keeps the two always in sync.
+  const headerRef = useRef<HTMLDivElement>(null);
+  const footerRef = useRef<HTMLDivElement>(null);
+  const [headerHeight, setHeaderHeight] = useState(100);
+  const [footerHeight, setFooterHeight] = useState(90);
+
+  useEffect(() => {
+    const header = headerRef.current;
+    const footer = footerRef.current;
+    if (!header || !footer) return;
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const height = Math.ceil(entry.contentRect.height);
+        if (entry.target === header) setHeaderHeight(height);
+        else if (entry.target === footer) setFooterHeight(height);
+      }
+    });
+    observer.observe(header);
+    observer.observe(footer);
+    return () => observer.disconnect();
+  }, []);
+
   // ── Selection helpers ──────────────────────────────────────────────────────
 
   // Toggle whether a single message is selected. Always returns a NEW Set so
@@ -170,8 +200,8 @@ export function ChatView({
   return (
     <div className="app-container h-full w-full">
       <ScrollArea
-        className="h-full w-full pt-[100px] transition-all duration-300 ease-in-out"
-        style={{ paddingBottom: `${90 + keyboardHeight + 12}px` }}
+        className="h-full w-full transition-all duration-300 ease-in-out"
+        style={{ paddingTop: `${headerHeight}px`, paddingBottom: `${footerHeight + keyboardHeight + 12}px` }}
       >
         <div className="p-4 space-y-4">
           <div className="flex items-center justify-center my-4">
@@ -331,7 +361,7 @@ export function ChatView({
       </ScrollArea>
 
       {/* ── Fixed header ─────────────────────────────────────────────────── */}
-      <div className="fixed top-0 left-0 right-0 z-10 bg-gray-800/80 backdrop-blur-lg border-b border-gray-700 shadow-sm">
+      <div ref={headerRef} className="fixed top-0 left-0 right-0 z-10 bg-gray-800/80 backdrop-blur-lg border-b border-gray-700 shadow-sm">
         <div className="px-4 pt-12 pb-3">
           {selectionMode ? (
             // [NEW] SELECTION-MODE HEADER: shows count + cancel + delete-selected.
@@ -491,60 +521,71 @@ export function ChatView({
       </div>
 
       {/* ── Fixed input bar ─────────────────────────────────────────────── */}
+      {/* [UI/UX REVIEW] This used to be two nested divs that BOTH applied
+          "px-4 pt-1 pb-safe" — doubling the side padding (32px dead space
+          per edge instead of 16px) and stacking two paddingBottoms that were
+          each supposed to be the full safe-area inset. "pb-safe" also isn't
+          a real Tailwind utility in this project (no plugin defines it), so
+          it silently did nothing; the real safe-area handling below uses an
+          explicit env() calc with a minimum floor so behavior is unchanged
+          on phones that don't need the extra inset and only grows on ones
+          (e.g. Android 15 edge-to-edge, gesture nav) that do. */}
       <div
-        className="fixed left-0 right-0 z-10 bg-gray-800 border-t border-gray-800 px-4 pt-1 pb-safe transition-all duration-300 ease-in-out"
-        style={{ bottom: `${keyboardHeight}px` }}
+        ref={footerRef}
+        className="fixed left-0 right-0 z-10 bg-gray-800 border-t border-gray-800 px-4 pt-2 transition-all duration-300 ease-in-out"
+        style={{
+          bottom: `${keyboardHeight}px`,
+          paddingBottom: "max(1rem, calc(env(safe-area-inset-bottom) + 0.5rem))",
+        }}
       >
-        <div className="px-4 pt-1 pb-safe">
-          {!isOnline && (
-            <div className="mb-2 flex items-center justify-center gap-2 text-xs text-orange-400 bg-orange-500/10 rounded-full py-1.5">
-              <WifiOff className="h-3 w-3" />
-              Messages will be sent when connection is restored
-            </div>
-          )}
-          <div className="flex items-end gap-2 pb-4">
-            <div className="flex-1 relative">
-              <Input
-                value={inputValue}
-                onChange={(e) => onInputChange(e.target.value)}
-                placeholder={isEmergency ? "Type emergency message…" : "Type your message..."}
-                className={`rounded-full text-base bg-gray-700 text-white placeholder:text-gray-400 transition-all focus:ring-2 px-4 py-3 min-h-[48px] resize-none ${
-                  isEmergency
-                    ? "border-red-700/60 focus:ring-red-500"
-                    : "border-gray-600 focus:ring-blue-500"
-                }`}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    onSendMessage();
-                  }
-                }}
-                onFocus={() => {
-                  setTimeout(() => {
-                    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-                  }, 300);
-                }}
-              />
-            </div>
-            {/* Send button glows red in emergency mode */}
-            <Button
-              onClick={onSendMessage}
-              size="icon"
-              className={`rounded-full transition-all h-12 w-12 flex-shrink-0 ${
-                inputValue.trim()
-                  ? isEmergency
-                    ? "bg-gradient-to-r from-orange-600 to-red-600 hover:from-orange-700 hover:to-red-700 shadow-lg shadow-red-500/30 active:scale-95 text-white"
-                    : "bg-blue-600 hover:bg-blue-700 shadow-lg shadow-blue-500/25 active:scale-95 text-white"
-                  : "bg-gray-700 hover:bg-gray-600 text-gray-400"
-              }`}
-              disabled={!inputValue.trim()}
-            >
-              {isEmergency && inputValue.trim()
-                ? <Zap className="h-5 w-5" />
-                : <Send className="h-5 w-5" />
-              }
-            </Button>
+        {!isOnline && (
+          <div className="mb-2 flex items-center justify-center gap-2 text-xs text-orange-400 bg-orange-500/10 rounded-full py-1.5">
+            <WifiOff className="h-3 w-3" />
+            Messages will be sent when connection is restored
           </div>
+        )}
+        <div className="flex items-end gap-2">
+          <div className="flex-1 relative">
+            <Input
+              value={inputValue}
+              onChange={(e) => onInputChange(e.target.value)}
+              placeholder={isEmergency ? "Type emergency message…" : "Type your message..."}
+              className={`rounded-full text-base bg-gray-700 text-white placeholder:text-gray-400 transition-all focus:ring-2 px-4 py-3 min-h-[48px] resize-none ${
+                isEmergency
+                  ? "border-red-700/60 focus:ring-red-500"
+                  : "border-gray-600 focus:ring-blue-500"
+              }`}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  onSendMessage();
+                }
+              }}
+              onFocus={() => {
+                setTimeout(() => {
+                  messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+                }, 300);
+              }}
+            />
+          </div>
+          {/* Send button glows red in emergency mode */}
+          <Button
+            onClick={onSendMessage}
+            size="icon"
+            className={`rounded-full transition-all h-12 w-12 flex-shrink-0 ${
+              inputValue.trim()
+                ? isEmergency
+                  ? "bg-gradient-to-r from-orange-600 to-red-600 hover:from-orange-700 hover:to-red-700 shadow-lg shadow-red-500/30 active:scale-95 text-white"
+                  : "bg-blue-600 hover:bg-blue-700 shadow-lg shadow-blue-500/25 active:scale-95 text-white"
+                : "bg-gray-700 hover:bg-gray-600 text-gray-400"
+            }`}
+            disabled={!inputValue.trim()}
+          >
+            {isEmergency && inputValue.trim()
+              ? <Zap className="h-5 w-5" />
+              : <Send className="h-5 w-5" />
+            }
+          </Button>
         </div>
       </div>
 

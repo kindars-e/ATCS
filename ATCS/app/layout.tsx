@@ -23,6 +23,12 @@ export const viewport: Viewport = {
   initialScale: 1,
   maximumScale: 1,
   userScalable: false,
+  // [UI/UX REVIEW] Without this, env(safe-area-inset-*) always resolves to 0
+  // in the WebView, so the safe-area padding added around fixed bottom bars
+  // (chat input, contacts FAB, waypoint footer) is a no-op even on devices
+  // that need it — namely Android 15 (targetSdk 35 here), which enforces
+  // edge-to-edge layout and lets content draw under the gesture nav bar.
+  viewportFit: "cover",
 };
 
 export default function RootLayout({

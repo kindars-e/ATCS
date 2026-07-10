@@ -35,9 +35,28 @@ const config: CapacitorConfig = {
     limitsNavigationsToAppBoundDomains: false
   },
   plugins: {
+    // [UI/UX REVIEW] On Android, @capacitor/keyboard's native code (Keyboard.java)
+    // does NOT actually read the `resize` string at all — only `resizeOnFullScreen`
+    // controls whether it natively resizes the WebView's content FrameLayout on
+    // every keyboard show/hide. That was `true`, so switching `resize` to 'None'
+    // alone changed nothing on Android (this only matters for iOS/other platforms).
+    // `resizeOnFullScreen: false` here is what actually disables Capacitor's own
+    // native resize on Android.
+    //
+    // There's also a THIRD, independent layer: with no windowSoftInputMode set,
+    // Android's own OS-level default (effectively adjustResize) ALSO natively
+    // resizes the Activity window around the keyboard — completely outside
+    // Capacitor's control. See AndroidManifest.xml's `android:windowSoftInputMode
+    // ="adjustNothing"` on MainActivity, which turns that off too.
+    //
+    // With all three native/OS-level resizes disabled, the app's own JS
+    // (hooks/use-mobile-keyboard.ts's keyboardWillShow/Hide listener + the
+    // manual `bottom: keyboardHeight` offset on the chat input bar) is the
+    // ONLY thing moving content — which is what its careful animation/padding
+    // math was actually built for.
     Keyboard: {
-      resize: KeyboardResize.Body, // <-- 2. Use the enum member here
-      resizeOnFullScreen: true,
+      resize: KeyboardResize.None,
+      resizeOnFullScreen: false,
     },
   },
 };

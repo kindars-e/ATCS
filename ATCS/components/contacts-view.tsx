@@ -329,8 +329,15 @@ export function ContactsView({
 
       <button
         onClick={onShowAddContact}
-        className="fixed bottom-6 right-6 w-14 h-14 bg-blue-600 hover:bg-blue-700 text-white rounded-full shadow-lg hover:shadow-xl transition-all duration-200 flex items-center justify-center group active:scale-95 z-10"
-        style={{ boxShadow: "0 4px 12px rgba(150, 50, 45, 0.45)" }}
+        className="fixed right-6 w-14 h-14 bg-blue-600 hover:bg-blue-700 text-white rounded-full shadow-lg hover:shadow-xl transition-all duration-200 flex items-center justify-center group active:scale-95 z-10"
+        style={{
+          boxShadow: "0 4px 12px rgba(150, 50, 45, 0.45)",
+          // [UI/UX REVIEW] additive safe-area floor — identical to the old
+          // fixed "bottom-6" (1.5rem) on devices with no inset to report,
+          // and only grows on edge-to-edge Android (gesture nav bar) so the
+          // button never sits under/behind it.
+          bottom: "max(1.5rem, calc(env(safe-area-inset-bottom) + 1rem))",
+        }}
       >
         <UserPlus className="h-6 w-6 transition-transform group-hover:scale-110" />
         <div className="absolute inset-0 rounded-full bg-white opacity-0 group-hover:opacity-20 transition-opacity duration-300" />

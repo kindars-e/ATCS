@@ -274,7 +274,10 @@ export function WaypointManagerModal({
           )}
 
           {/* Add buttons */}
-          <div className="px-4 pb-8 pt-3 border-t border-gray-800 space-y-2">
+          <div
+            className="px-4 pt-3 border-t border-gray-800 space-y-2"
+            style={{ paddingBottom: "max(2rem, calc(env(safe-area-inset-bottom) + 1.5rem))" }}
+          >
             <Button
               onClick={() => { setView("add-gps"); setName(""); setNotes(""); setType("waypoint"); }}
               disabled={!userPosition}
